@@ -1,0 +1,16 @@
+.env
+Game.ini
+
+Engine/
+Insurgency/Binaries/
+Insurgency/Content/
+Insurgency/Plugins/
+
+Insurgency/Saved/Config/CrashReportClient
+Insurgency/Saved/PersistentDownloadDir
+Insurgency/Mods/
+
+*.log
+*.tmp
+*.pid
+*.so
