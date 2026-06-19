@@ -277,8 +277,18 @@ def watch_logs() -> None:
                     if not line:
                         time.sleep(0.5)
                         try:
-                            if os.stat(LOG_FILE_PATH).st_ino != current_inode:
-                                log.info("Log rotation detected — reopening file.")
+                            st = os.stat(LOG_FILE_PATH)
+                            # Rotated by replacement: a brand-new file took the path.
+                            if st.st_ino != current_inode:
+                                log.info("Log rotation detected (new inode) — reopening file.")
+                                break
+                            # Rotated in place: Insurgency Sandstorm copies the log to a
+                            # timestamped backup and TRUNCATES Insurgency.log, keeping the
+                            # SAME inode. Our read offset is then stranded past EOF and we
+                            # would silently stop seeing events. Detect the shrink and reopen.
+                            if st.st_size < f.tell():
+                                log.info("Log truncation detected (size %d < pos %d) — reopening file.",
+                                         st.st_size, f.tell())
                                 break
                         except FileNotFoundError:
                             log.warning("Log file disappeared — waiting...")
