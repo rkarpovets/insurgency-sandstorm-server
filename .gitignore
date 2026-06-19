@@ -14,3 +14,6 @@ Insurgency/Mods/
 *.tmp
 *.pid
 *.so
+
+__pycache__/
+*.bak.*
