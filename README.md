@@ -28,7 +28,7 @@ join/leave messages to in-game chat.
 
 ### Config (`server.sh`, `Insurgency/…`)
 - `server.sh` launches the server, sourcing secrets from `.env`, and boots straight to a
-  fixed Checkpoint scenario (so it never sits on the training Range).
+  fixed Checkpoint scenario.
 - Tunable: tick rate, player slots, map cycle, mutators — see **Configuration**.
 
 ## Requirements
