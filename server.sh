@@ -15,7 +15,7 @@ MAP=$(printf '%s' "$SCENARIO" | cut -d_ -f2)
 echo "server.sh: starting on random scenario $SCENARIO (map $MAP)"
 
 ./Insurgency/Binaries/Linux/InsurgencyServer-Linux-Shipping \
-  "-ModDownloadTravelTo=$MAP?Scenario=$SCENARIO?MaxPlayers=12" \
+  -ModDownloadTravelTo=Buhriz?Scenario=Scenario_Tideway_Checkpoint_Security?MaxPlayers=12 \
   -Port=27000 \
   -QueryPort=27010 \
   -Rcon \
