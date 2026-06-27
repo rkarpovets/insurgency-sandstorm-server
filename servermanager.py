@@ -51,40 +51,63 @@ _last_travel_seen: float = 0.0        # last ProcessServerTravel observed in the
 # Graceful shutdown
 def _handle_signal(signum, _frame):
     log.info("Received signal %s — shutting down cleanly.", signal.Signals(signum).name)
+    _rcon_close()
     sys.exit(0)
 
 signal.signal(signal.SIGINT,  _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
 
-# RCON — short-lived connection per command.
+# RCON — a SINGLE persistent connection, reused for every command.
 #
-# Insurgency Sandstorm's RCON listener silently drops idle connections and is
-# reset on every map travel, which leaves a held-open socket half-open. A
-# persistent connection therefore appears to work for hours and then quietly
-# stops delivering commands (the socket blocks on recv instead of raising, so
-# reconnect logic never fires). Opening a fresh connection per command costs a
-# few milliseconds — negligible at join/leave frequency — and removes that
-# entire class of stale-socket failures.
-def send_rcon(command: str) -> str | None:
-    for attempt in range(1, RCON_RETRIES + 1):
-        client = None
+# Insurgency Sandstorm leaks a server-side thread for every RCON connection it
+# accepts (the FRconConnection thread is never freed on disconnect). Opening a
+# fresh connection per command therefore piles up hundreds of zombie threads
+# over a few hours and destabilises the game server. So we keep ONE connection
+# and reuse it, reconnecting only when a command actually fails (e.g. after a
+# map travel resets the listener). The earlier "chat stops after hours" symptom
+# was really the in-place log-truncation bug (fixed separately), not RCON.
+_rcon_client: RconClient | None = None
+
+
+def _rcon_close() -> None:
+    global _rcon_client
+    if _rcon_client is not None:
         try:
-            client = RconClient(RCON_IP, RCON_PORT, passwd=RCON_PASSWORD, timeout=RCON_TIMEOUT)
-            client.connect(login=True)
-            result = client.run(command)
+            _rcon_client.close()
+        except Exception:
+            pass
+        _rcon_client = None
+
+
+def _rcon_connect() -> bool:
+    global _rcon_client
+    try:
+        client = RconClient(RCON_IP, RCON_PORT, passwd=RCON_PASSWORD, timeout=RCON_TIMEOUT)
+        client.connect(login=True)
+        _rcon_client = client
+        return True
+    except Exception as e:
+        log.warning("RCON connect failed: %s", e)
+        _rcon_client = None
+        return False
+
+
+def send_rcon(command: str) -> str | None:
+    global _rcon_client
+    for attempt in range(1, RCON_RETRIES + 1):
+        if _rcon_client is None and not _rcon_connect():
+            time.sleep(0.5)
+            continue
+        try:
+            result = _rcon_client.run(command)
             log.debug("RCON ← %r  →  %r", command, result)
             return result
         except Exception as e:
             log.warning("RCON command %r failed (attempt %d/%d): %s",
                         command, attempt, RCON_RETRIES, e)
+            _rcon_close()            # drop the dead socket; reconnect next attempt
             time.sleep(0.5)
-        finally:
-            if client is not None:
-                try:
-                    client.close()
-                except Exception:
-                    pass
 
     log.error("RCON command %r gave up after %d attempts.", command, RCON_RETRIES)
     return None
