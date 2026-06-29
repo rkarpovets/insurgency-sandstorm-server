@@ -73,11 +73,10 @@ _last_travel_seen: float = 0.0        # last ProcessServerTravel observed in the
 
 # Game-alert state
 _current_map: str = "—"               # human map name (Scenario token, not the level)
-_prev_count: int = 0                  # player count at the last roster change (milestones)
-_last_event: str = ""                 # short text of the most recent join/leave
+_current_side: str = ""               # team/side of the scenario (Security / Insurgents)
 _board_msg_id: int | None = None      # pinned Telegram board message to edit in place
 _board_dirty = threading.Event()      # set when the board needs a refresh
-_event_queue: "queue.Queue[str]" = queue.Queue()  # milestone/event messages to send
+_event_queue: "queue.Queue[str]" = queue.Queue()  # join/leave messages to send
 
 
 # Graceful shutdown
@@ -216,8 +215,9 @@ def seed_cache_from_rcon() -> bool:
 #  Design: the join/leave events already computed by handle_join /
 #  reconcile_players are the single source of truth. We only add two extra
 #  sinks here — never a second polling path:
-#    * a SINGLE pinned Telegram message ("board") edited in place on every
-#      roster/map change, plus short milestone lines on active/empty;
+#    * one NEW message per join/leave (with live count + map), AND
+#    * a SINGLE pinned "board" (server name, count, map, roster) edited in
+#      place — refreshed on every roster/map change;
 #    * a node_exporter textfile metric (iss_players_online) for Grafana.
 #  All Telegram I/O happens on a dedicated worker thread so a slow/broken API
 #  call can never stall the RCON loop or log tailing.
@@ -228,6 +228,8 @@ def player_count() -> int:
 
 
 def map_label() -> str:
+    if _current_side:
+        return f"{_current_map} ({_current_side})"
     return _current_map
 
 
@@ -265,20 +267,19 @@ def _save_board_id(msg_id: int) -> None:
 
 
 def build_board_text() -> str:
-    """Render the pinned status board (Telegram HTML parse mode)."""
+    """Render the pinned status board (Telegram HTML parse mode): server name,
+    live count, current map, and the list of connected players."""
     count = player_count()
     roster = "\n".join(f"• {html.escape(n)}" for n in player_cache.values()) or "<i>empty</i>"
-    last = f"\n\n<i>{html.escape(_last_event)}</i>" if _last_event else ""
     return (
         f"🎮 <b>{html.escape(SERVER_NAME)}</b>\n"
         f"\n"
         f"👥 Players: <b>{count}/{MAX_PLAYERS}</b>\n"
         f"🗺️ Map: <b>{html.escape(map_label())}</b>\n"
         f"\n"
-        f"{roster}"
-        f"{last}\n"
+        f"{roster}\n"
         f"\n"
-        f"<i>updated {time.strftime('%H:%M:%S')}</i>"
+        f"<i>updated {time.strftime('%H:%M:%S', time.gmtime())} UTC</i>"
     )
 
 
@@ -309,16 +310,19 @@ def _render_and_edit_board() -> None:
             "chat_id": TELEGRAM_CHAT_ID, "message_id": _board_msg_id,
             "disable_notification": "true",
         })
+    else:
+        log.warning("Board sendMessage failed: %s",
+                    r.get("description") if r else "no response")
 
 
 def notify_event(text: str) -> None:
-    """Queue a one-off milestone message (active/empty). Non-blocking."""
+    """Queue a join/leave message (sent as its own message). Non-blocking."""
     if TELEGRAM_ENABLED:
         _event_queue.put(text)
 
 
 def telegram_worker() -> None:
-    """Single background thread: sends queued milestone messages and refreshes
+    """Single background thread: sends queued join/leave messages and refreshes
     the board at most every BOARD_DEBOUNCE seconds (coalesces bursts)."""
     while True:
         try:
@@ -362,28 +366,22 @@ def write_metrics() -> None:
         log.warning("Could not write metrics file %s: %s", METRICS_FILE, e)
 
 
-def on_roster_change(event: str | None = None) -> None:
-    """Single entry point after any join/leave/safety-net change: fires
-    milestones, refreshes the board, and updates the Grafana metric."""
-    global _prev_count, _last_event
-    if event:
-        _last_event = event
+def player_event(name: str, action: str) -> None:
+    """Announce a join/leave as its OWN message, then refresh the pinned board
+    and the Grafana metric. `action` is 'joined' or 'left'. The count already
+    reflects this event (join: added on Login; leave: popped before this call)."""
     count = player_count()
-    if _prev_count == 0 and count >= 1:
-        notify_event(f"🟢 <b>Server is now active</b>\n👥 {count}/{MAX_PLAYERS} · {html.escape(map_label())}")
-    elif _prev_count > 0 and count == 0:
-        notify_event("🔴 <b>Server is now empty</b>")
-    _prev_count = count
+    notify_event(
+        f"<b>{html.escape(name)}</b> {action} the server\n"
+        f"{count}/{MAX_PLAYERS} - {html.escape(map_label())}"
+    )
     _board_dirty.set()
     write_metrics()
 
 
-def init_roster_baseline() -> None:
-    """After startup pre-load: record the baseline count and publish the first
-    board/metric WITHOUT firing an 'active' milestone for already-connected
-    players (a restart shouldn't look like everyone just joined)."""
-    global _prev_count
-    _prev_count = player_count()
+def roster_refresh() -> None:
+    """Refresh the board + metric WITHOUT announcing — used at startup and for
+    safety-net reconciliation of players we picked up implicitly."""
     _board_dirty.set()
     write_metrics()
 
@@ -420,24 +418,29 @@ def handle_login(line: str) -> bool:
     return True
 
 
-# ProcessServerTravel: <Level>?Scenario=Scenario_<Map>_<Mode>_<Side>?Game=<Mode>?
-# NOTE: the human map name is the Scenario token (e.g. "Tideway"), NOT the
-# level (e.g. "Buhriz") — they differ for several maps. The server is
-# Checkpoint-only, so we capture just the map and ignore the mode.
-_TRAVEL_RE = re.compile(r'Scenario=Scenario_([A-Za-z0-9]+)_')
+# ProcessServerTravel: <Level>?scenario=Scenario_<Map>_<Mode>_<Side>?...
+# NOTE 1: the game writes the key BOTH ways — "Scenario=" (travelscenario / on
+#         boot) and "scenario=" (normal map change). Match case-insensitively
+#         on the key; the value always starts with capital "Scenario_".
+# NOTE 2: the human map name is the Scenario token (e.g. "Tideway"), NOT the
+#         level (e.g. "Buhriz") — they differ for several maps.
+# We show map + side (Security / Insurgents); the mode is always Checkpoint.
+_TRAVEL_RE = re.compile(
+    r'[Ss]cenario=Scenario_([A-Za-z0-9]+)_([A-Za-z0-9]+)(?:_([A-Za-z0-9]+))?')
 
 
 def handle_travel(line: str) -> bool:
     """Note map changes (pause leave reconciliation during the unstable
-    session-rebuild window) and capture the new map for the board."""
+    session-rebuild window) and capture the new map + side for the board."""
     if "ProcessServerTravel" not in line:
         return False
-    global _last_travel_seen, _current_map
+    global _last_travel_seen, _current_map, _current_side
     _last_travel_seen = time.monotonic()
     m = _TRAVEL_RE.search(line)
     if m:
         _current_map = m.group(1)
-        log.info("[MAP] %s", _current_map)
+        _current_side = m.group(3) or ""
+        log.info("[MAP] %s", map_label())
         _board_dirty.set()
         write_metrics()
     log.debug("Map travel observed — pausing leave reconciliation briefly.")
@@ -453,7 +456,7 @@ def handle_join(line: str) -> bool:
         name = sanitize_name(m.group(1))
         log.info("[JOIN] %s", name)
         send_rcon(f"say {name} connected")
-        on_roster_change(f"🟢 {name} joined")
+        player_event(name, "joined")
     return True
 
 
@@ -497,14 +500,14 @@ def reconcile_players() -> None:
                 name = cache_pop(steam_id)
                 log.info("[LEAVE] %s (%s)", name, steam_id)
                 send_rcon(f"say {name} disconnected")
-                on_roster_change(f"🔴 {name} left")
+                player_event(name, "left")
 
     # Safety net: track present players we somehow missed, so their later
     # departure is still caught (joins themselves are announced by handle_join).
     for steam_id, name in online.items():
         if steam_id not in player_cache:
             cache_add(steam_id, sanitize_name(name))
-            on_roster_change()      # refresh board/metric for the missed arrival
+            roster_refresh()        # refresh board/metric for the missed arrival
 
 
 def handle_session_warning(line: str) -> bool:
@@ -572,20 +575,22 @@ def seed_map_from_tail(f) -> None:
     """Find the most recent map from the log tail so the board shows the right
     map immediately on startup (before the next travel happens). Leaves the file
     positioned back at EOF for tailing."""
-    global _current_map
+    global _current_map, _current_side
     try:
         f.seek(0, os.SEEK_END)
         size = f.tell()
-        f.seek(max(0, size - 4 * 1024 * 1024))     # last 4 MB is plenty
+        f.seek(max(0, size - 30 * 1024 * 1024))    # last 30 MB ≈ several map changes
         last = None
         for line in f:
-            if "ProcessServerTravel" in line:
+            # keep only real travels (skip "?restart" lines without a scenario)
+            if "ProcessServerTravel" in line and _TRAVEL_RE.search(line):
                 last = line
         if last:
             m = _TRAVEL_RE.search(last)
             if m:
                 _current_map = m.group(1)
-                log.info("Seeded current map from log: %s", _current_map)
+                _current_side = m.group(3) or ""
+                log.info("Seeded current map from log: %s", map_label())
     except Exception as e:
         log.debug("Map seed from tail skipped: %s", e)
     finally:
@@ -610,7 +615,7 @@ def watch_logs() -> None:
                 log.info("Pre-loading player cache (RCON listplayers, tail fallback)...")
                 preload_cache(f)
                 seed_map_from_tail(f)
-                init_roster_baseline()
+                roster_refresh()
                 log.info("Cache pre-loaded: %d player(s); map %s.",
                          len(player_cache), map_label())
 
