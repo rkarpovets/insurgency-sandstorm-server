@@ -67,7 +67,7 @@ log = logging.getLogger(__name__)
 
 # State
 player_cache: OrderedDict[str, str] = OrderedDict()
-_leave_check_pending: bool = False    # a session warning asked for an immediate reconcile
+_reconcile_pending: bool = False    # a join/session-warning asked for an immediate reconcile
 _last_travel_time: float = 0.0        # last crash-recovery travelscenario we issued
 _last_travel_seen: float = 0.0        # last ProcessServerTravel observed in the log
 
@@ -448,15 +448,14 @@ def handle_travel(line: str) -> bool:
 
 
 def handle_join(line: str) -> bool:
+    """A successful join only TRIGGERS a prompt reconcile — the actual "joined"
+    announcement comes from reconcile_players once the player is confirmed in
+    listplayers. This avoids announcing arrivals (or the wrong count) before the
+    player is really in-session."""
     if "LogNet: Join succeeded:" not in line:
         return False
-
-    m = re.search(r'LogNet: Join succeeded:\s*(.+)', line)
-    if m:
-        name = sanitize_name(m.group(1))
-        log.info("[JOIN] %s", name)
-        send_rcon(f"say {name} connected")
-        player_event(name, "joined")
+    global _reconcile_pending
+    _reconcile_pending = True
     return True
 
 
@@ -470,16 +469,19 @@ def _listplayers_online() -> dict[str, str] | None:
 
 
 def reconcile_players() -> None:
-    """Detect departures by reconciling the cache against RCON listplayers.
+    """Single source of truth for BOTH joins and leaves: diff the cache against
+    RCON listplayers (the only authoritative list of who is actually in-session).
 
-    The server log's "Player X is not part of session" warning is NOT a reliable
-    leave signal: it repeats for still-connected players and fires for everyone
-    during map travel. So we use it only as a hint to run this check (see
-    handle_session_warning) and treat listplayers as the authoritative set of
-    who is actually connected.
+    This is why a connecting client (a log "Login request" / "Join succeeded")
+    is never announced directly — a player who is mid-handshake or still loading
+    the map is not yet in listplayers, and announcing off the log produced
+    phantom "left" messages before the player had even arrived. Here a player is
+    announced "joined" only once they appear in listplayers, and "left" only
+    once they disappear from it (confirmed by a second snapshot against a
+    momentarily truncated reply).
 
-    Any cached player missing from listplayers is confirmed gone with a second
-    snapshot (guards a momentarily truncated reply) before announcing a leave.
+    The cache is seeded silently at startup, so an existing roster is NOT
+    re-announced as a flood of joins.
     """
     # During/just after a map change the session is rebuilding and listplayers
     # can momentarily omit travelling players; don't reconcile in that window.
@@ -490,6 +492,7 @@ def reconcile_players() -> None:
     if online is None:
         return
 
+    # Leaves: cached players no longer in listplayers (confirmed twice).
     suspects = [sid for sid in player_cache if sid not in online]
     if suspects:
         confirm = _listplayers_online()         # second snapshot guards a truncated reply
@@ -502,12 +505,14 @@ def reconcile_players() -> None:
                 send_rcon(f"say {name} disconnected")
                 player_event(name, "left")
 
-    # Safety net: track present players we somehow missed, so their later
-    # departure is still caught (joins themselves are announced by handle_join).
+    # Joins: players now in listplayers that we hadn't recorded yet.
     for steam_id, name in online.items():
         if steam_id not in player_cache:
-            cache_add(steam_id, sanitize_name(name))
-            roster_refresh()        # refresh board/metric for the missed arrival
+            name = sanitize_name(name)
+            cache_add(steam_id, name)
+            log.info("[JOIN] %s (%s)", name, steam_id)
+            send_rcon(f"say {name} connected")
+            player_event(name, "joined")
 
 
 def handle_session_warning(line: str) -> bool:
@@ -517,15 +522,16 @@ def handle_session_warning(line: str) -> bool:
     warnings cost nothing."""
     if "is not part of session" not in line:
         return False
-    m = re.search(r'Player\s+(\d+)\s+is not part of session', line)
-    if m and m.group(1) in player_cache:
-        global _leave_check_pending
-        _leave_check_pending = True
+    if player_cache:                 # only worth a reconcile if someone could leave
+        global _reconcile_pending
+        _reconcile_pending = True
     return True
 
 
-# Main loop
-HANDLERS = [handle_crash, handle_travel, handle_login, handle_join, handle_session_warning]
+# Main loop. handle_login is deliberately NOT here: it is used only by the
+# startup tail-preload fallback. Live arrivals are detected authoritatively by
+# reconcile_players (via listplayers), never from the connecting-client log line.
+HANDLERS = [handle_crash, handle_travel, handle_join, handle_session_warning]
 
 def process_line(line: str, maps_pool: list[str]) -> None:
     for handler in HANDLERS:
@@ -598,7 +604,7 @@ def seed_map_from_tail(f) -> None:
 
 
 def watch_logs() -> None:
-    global _leave_check_pending
+    global _reconcile_pending
     maps_pool = load_maps()
     log.info("Monitoring: %s", LOG_FILE_PATH)
 
@@ -625,8 +631,8 @@ def watch_logs() -> None:
                 while True:
                     # Reconcile on a session-warning trigger (near-instant leaves)
                     # or on the periodic safety-net interval.
-                    if _leave_check_pending or time.monotonic() - last_reconcile >= PLAYER_POLL_INTERVAL:
-                        _leave_check_pending = False
+                    if _reconcile_pending or time.monotonic() - last_reconcile >= PLAYER_POLL_INTERVAL:
+                        _reconcile_pending = False
                         reconcile_players()
                         last_reconcile = time.monotonic()
 

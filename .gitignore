@@ -21,3 +21,6 @@ __pycache__/
 Insurgency/Saved/Config/LinuxServer/*
 !Insurgency/Saved/Config/LinuxServer/Game.ini
 !Insurgency/Saved/Config/LinuxServer/Engine.ini
+
+# servermanager runtime state
+board_message_id.txt
