@@ -2,8 +2,14 @@
 
 Configuration and tooling for a co-op (**Checkpoint**) *Insurgency: Sandstorm* dedicated
 server running the **ISMC** mod. The centrepiece is `servermanager.py` — a small,
-dependency-light watcher that fixes the end-of-match map-vote freeze and posts
-join/leave messages to in-game chat.
+dependency-light watcher that keeps the server healthy (recovering from the end-of-match
+map-vote freeze) and surfaces live player activity to in-game chat, a pinned Telegram
+board, and a Prometheus/Grafana metric.
+
+> Provisioned in production by a separate Infrastructure-as-Code repo,
+> [server-infrastructure](https://github.com/rkarpovets/server-infrastructure): this repo
+> holds the game-specific config and the manager, that one wires them into systemd, the
+> firewall, and the monitoring stack.
 
 ## Features
 
@@ -12,14 +18,23 @@ join/leave messages to in-game chat.
   `Unhandled conclusion from mapcycle map vote` / `INVALID map index` and would otherwise
   hang. The manager detects this and recovers via RCON `travelscenario` to a random map
   from the cycle (with a short cooldown to avoid double-triggering).
-- **Join / leave chat messages** — `X connected` / `X disconnected` in game chat.
+- **Live player tracking** — who is actually connected, kept accurate across map changes:
   - Joins are instant, from the reliable `LogNet: Join succeeded` log line.
   - Leaves are detected by reconciling the player cache against RCON `listplayers` (the
-    authoritative list of who is actually connected) — triggered immediately by the
-    session log line and confirmed with a second snapshot. The naive
-    `is not part of session` line is **not** trusted on its own: it repeats for
-    still-connected players and fires for everyone during map travel, which otherwise
-    causes false "disconnected" spam and missed real departures.
+    authoritative list) — triggered by the session log line and confirmed with a second
+    snapshot. The naive `is not part of session` line is **not** trusted on its own: it
+    repeats for still-connected players and fires for everyone during map travel, which
+    otherwise causes false "disconnected" spam and missed real departures.
+- **Three notification channels** — all optional and independent (any can be left off):
+  - **In-game chat** — `X connected` / `X disconnected` via RCON `say`.
+  - **Telegram** — a single *pinned board* (server name, player count, current map, roster)
+    edited in place, never spamming new messages: the board's message id is persisted
+    (`BOARD_STATE_FILE`) so restarts reuse it. Plus a one-off message per join/leave. All
+    Telegram I/O runs on a dedicated, debounced worker thread, so a slow or broken Telegram
+    API can never stall game monitoring.
+  - **Prometheus metric** — atomically writes `iss_players_online`, `iss_players_max` and
+    `iss_map_info` to a node_exporter textfile (`METRICS_FILE`), which Grafana graphs
+    against CPU load.
 - **Robust RCON** — a fresh connection per command, so a stale/half-open socket can't
   silently stop chat after a few hours of uptime.
 - **Survives map changes & restarts** — handles ISS's in-place log rotation (the game
@@ -30,26 +45,27 @@ join/leave messages to in-game chat.
 - `server.sh` launches the server, sourcing secrets from `.env`, and boots straight to a
   fixed Checkpoint scenario.
 - Tunable: tick rate, player slots, map cycle, mutators — see **Configuration**.
+- Hand-edited `Game.ini` and `Engine.ini` are version-controlled; the engine-generated
+  configs around them are git-ignored.
 
 ## Requirements
 - A Linux host with an Insurgency: Sandstorm **dedicated server** (SteamCMD app `581330`).
 - **Python 3.10+** (uses modern type-union syntax).
 - Python packages: `pip install -r requirements.txt` (`rcon`, `python-dotenv`).
 - RCON enabled on the server (the launch script enables it).
+- *Optional:* a Telegram bot + chat for alerts; a node_exporter textfile dir for the metric.
 
 ## Setup
 1. Place these files in your server directory (e.g. `/home/steam/sandstorm_server`).
 2. Create your environment file from the template and fill in your values:
    ```bash
-   cp .env.example .env
+   cp .env.example /home/steam/.env     # or wherever ENV_FILE points
    # edit .env: RCON_IP / RCON_PORT / RCON_PASSWORD, GSLT & GameStats tokens,
-   #            LOG_FILE_PATH, MAPCYCLE_FILE
+   #            LOG_FILE_PATH, MAPCYCLE_FILE, and (optional) TELEGRAM_* / METRICS_FILE
    ```
-3. Create your `Game.ini` from the template (gameplay settings; keep secrets out of it):
-   ```bash
-   cp Insurgency/Saved/Config/LinuxServer/Game.ini.example \
-      Insurgency/Saved/Config/LinuxServer/Game.ini
-   ```
+3. Review the gameplay config — `Insurgency/Saved/Config/LinuxServer/Game.ini` and
+   `Engine.ini` ship with sensible defaults; edit to taste. (Secrets stay in `.env`, never
+   in these files.)
 4. Install Python dependencies: `pip install -r requirements.txt`
 5. Make the launcher executable: `chmod +x server.sh`
 6. Run both as systemd services (recommended) — see **Running with systemd**.
@@ -103,7 +119,7 @@ Enable and watch logs:
 sudo systemctl daemon-reload
 sudo systemctl enable --now sandstorm-server.service sandstorm-manager.service
 
-sudo systemctl restart sandstorm-server.service     # restart the game (replaces tmux)
+sudo systemctl restart sandstorm-server.service     # restart the game
 sudo journalctl -u sandstorm-server.service -f      # live game log
 sudo journalctl -u sandstorm-manager.service -f     # manager (also written to servermanager.log)
 ```
@@ -120,6 +136,9 @@ sudo journalctl -u sandstorm-manager.service -f     # manager (also written to s
 | Starting map | `server.sh` → `-ModDownloadTravelTo=<Map>?Scenario=<Scenario>` |
 | Gameplay / bots | `Insurgency/Saved/Config/LinuxServer/Game.ini` |
 | Mutators / mods | `server.sh` → `-Mutators=…`, `-ModList=Mods.txt` |
+| Admins / MOTD | `Insurgency/Config/Server/Admins.txt`, `Motd.txt` |
+| Telegram board & alerts | `.env` → `TELEGRAM_GAME_TOKEN`, `TELEGRAM_GAME_CHAT_ID` |
+| Grafana player metric | `.env` → `METRICS_FILE` (node_exporter textfile path) |
 | Manager env path | `ENV_FILE` (defaults to `/home/steam/.env`) |
 
 **Tick rate vs. capacity.** `NetServerMaxTickRate` drives the most expensive (replication +
@@ -134,8 +153,8 @@ silently falls back to the training **Range**. Use the correct level name, or sw
 runtime with RCON `travelscenario <Scenario>` — that resolves the level itself.
 
 ## Notes
-- `.env` and the real `Game.ini` are git-ignored — **never commit secrets** (RCON password,
-  GSLT/GameStats tokens).
+- `.env` and the engine-generated configs are git-ignored — **never commit secrets** (RCON
+  password, GSLT/GameStats tokens, Telegram token).
 - `Insurgency.log` grows very fast (multiple GB/day on a busy server) and is only rotated on
   restart — set up a size-capped cleanup (e.g. a small cron/systemd-timer that prunes old
   `Insurgency-backup-*.log` files) so it doesn't fill the disk.
