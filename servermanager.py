@@ -528,19 +528,16 @@ def handle_session_warning(line: str) -> bool:
     return True
 
 
-# Main loop. handle_login is deliberately NOT here: it is used only by the
-# startup tail-preload fallback. Live arrivals are detected authoritatively by
-# reconcile_players (via listplayers), never from the connecting-client log line.
-HANDLERS = [handle_crash, handle_travel, handle_join, handle_session_warning]
-
+# Main loop dispatch. handle_login is deliberately NOT called here: it is used
+# only by the startup tail-preload fallback. Live arrivals are detected
+# authoritatively by reconcile_players (via listplayers), never from the
+# connecting-client log line. handle_crash runs first because it needs maps_pool.
 def process_line(line: str, maps_pool: list[str]) -> None:
-    for handler in HANDLERS:
-        if handler is handle_crash:
-            if handler(line, maps_pool):
-                return
-        else:
-            if handler(line):
-                return
+    if handle_crash(line, maps_pool):
+        return
+    for handler in (handle_travel, handle_join, handle_session_warning):
+        if handler(line):
+            return
 
 
 def preload_cache_from_tail(f) -> None:
