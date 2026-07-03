@@ -146,8 +146,8 @@ def send_rcon(command: str) -> str | None:
 
 # Helpers
 def sanitize_name(name: str) -> str:
-    """Strip characters that could be used for RCON command injection."""
-    return re.sub(r'[^\w\s\-]', '', name)[:32].strip() or "UnknownPlayer"
+    """Strip control chars that could inject a second RCON command."""
+    return re.sub(r'[\x00-\x1f\x7f]', '', name).strip()[:32] or "UnknownPlayer"
 
 
 def load_maps() -> list[str]:
