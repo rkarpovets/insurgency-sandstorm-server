@@ -185,8 +185,9 @@ def cache_pop(steam_id: str) -> str:
 
 
 # listplayers row: "<id> | <name> | SteamNWI:<steamid> | <ip> | <score> |"
-# Empty/bot slots show "None:INVALID" and are skipped automatically.
-_LISTPLAYERS_RE = re.compile(r'\|\s*([^|]*?)\s*\|\s*SteamNWI:(\d+)')
+# The name column may itself contain "|", so we anchor on the numeric ID
+# column and read the name up to the SteamNWI field.
+_LISTPLAYERS_RE = re.compile(r'^\s*\d+\s*\|\s*(.+?)\s*\|\s*SteamNWI:(\d+)', re.MULTILINE)
 
 
 def parse_listplayers(text: str) -> list[tuple[str, str]]:
