@@ -25,7 +25,13 @@ RCON_IP          = os.environ.get("RCON_IP")
 RCON_PORT        = int(os.environ.get("RCON_PORT"))
 RCON_PASSWORD    = os.environ.get("RCON_PASSWORD")
 
-# --- Game alerts (Telegram board + Grafana metric) — all optional ---
+# Steam Web API key - resolves SteamID64 to the current persona name. We do NOT
+# trust the listplayers name column ("|" is both the column separator and a legal
+# name character, so it is unparseable when a name contains "|"). Empty key -> names
+# fall back to "SteamID:<id>". Get one at https://steamcommunity.com/dev/apikey
+STEAM_API_KEY    = os.environ.get("STEAM_API_KEY", "").strip()
+
+# --- Game alerts (Telegram board + Grafana metric) - all optional ---
 # Leave the Telegram vars empty to disable alerts entirely (e.g. local tests).
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_GAME_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_GAME_CHAT_ID", "").strip()
@@ -34,7 +40,7 @@ MAX_PLAYERS      = int(os.environ.get("MAX_PLAYERS", "16"))
 # Where to persist the pinned board's message_id so restarts edit it in place
 # instead of spamming a new board each time.
 BOARD_STATE_FILE = os.environ.get("BOARD_STATE_FILE", "board_message_id.txt")
-# node_exporter textfile-collector target. Empty → don't write the metric.
+# node_exporter textfile-collector target. Empty -> don't write the metric.
 METRICS_FILE     = os.environ.get("METRICS_FILE", "").strip()
 
 TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
@@ -72,7 +78,7 @@ _last_travel_time: float = 0.0        # last crash-recovery travelscenario we is
 _last_travel_seen: float = 0.0        # last ProcessServerTravel observed in the log
 
 # Game-alert state
-_current_map: str = "—"               # human map name (Scenario token, not the level)
+_current_map: str = "-"               # human map name (Scenario token, not the level)
 _current_side: str = ""               # team/side of the scenario (Security / Insurgents)
 _board_msg_id: int | None = None      # pinned Telegram board message to edit in place
 _board_dirty = threading.Event()      # set when the board needs a refresh
@@ -81,7 +87,7 @@ _event_queue: "queue.Queue[str]" = queue.Queue()  # join/leave messages to send
 
 # Graceful shutdown
 def _handle_signal(signum, _frame):
-    log.info("Received signal %s — shutting down cleanly.", signal.Signals(signum).name)
+    log.info("Received signal %s - shutting down cleanly.", signal.Signals(signum).name)
     _rcon_close()
     sys.exit(0)
 
@@ -89,7 +95,7 @@ signal.signal(signal.SIGINT,  _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
 
-# RCON — a SINGLE persistent connection, reused for every command.
+# RCON - a SINGLE persistent connection, reused for every command.
 #
 # Insurgency Sandstorm leaks a server-side thread for every RCON connection it
 # accepts (the FRconConnection thread is never freed on disconnect). Opening a
@@ -132,7 +138,7 @@ def send_rcon(command: str) -> str | None:
             continue
         try:
             result = _rcon_client.run(command)
-            log.debug("RCON ← %r  →  %r", command, result)
+            log.debug("RCON <- %r  ->  %r", command, result)
             return result
         except Exception as e:
             log.warning("RCON command %r failed (attempt %d/%d): %s",
@@ -163,7 +169,7 @@ def load_maps() -> list[str]:
 
     if not maps:
         fallback = "Scenario_Crossing_Checkpoint_Insurgents"
-        log.warning("No maps loaded — using fallback: %s", fallback)
+        log.warning("No maps loaded - using fallback: %s", fallback)
         return [fallback]
 
     log.info("Loaded %d map(s) from MapCycle.txt.", len(maps))
@@ -177,36 +183,58 @@ def cache_add(steam_id: str, name: str) -> None:
     player_cache[steam_id] = name
     while len(player_cache) > MAX_CACHE_SIZE:
         evicted_id, evicted_name = player_cache.popitem(last=False)
-        log.debug("Cache full — evicted %s (%s).", evicted_name, evicted_id)
+        log.debug("Cache full - evicted %s (%s).", evicted_name, evicted_id)
 
 
 def cache_pop(steam_id: str) -> str:
     return player_cache.pop(steam_id, f"SteamID:{steam_id}")
 
 
-# listplayers row: "<id> | <name> | SteamNWI:<steamid> | <ip> | <score> |"
-# The name column may itself contain "|", so we anchor on the numeric ID
-# column and read the name up to the SteamNWI field.
-_LISTPLAYERS_RE = re.compile(r'^\s*\d+\s*\|\s*(.+?)\s*\|\s*SteamNWI:(\d+)', re.MULTILINE)
+# Every human player in listplayers carries "SteamNWI:<steamid64>" (bots show
+# "None:INVALID"). We take ONLY the SteamID - it is unambiguous digits, unlike
+# the "|"-delimited name column - and resolve names via the Steam Web API.
+_STEAMID_RE = re.compile(r'SteamNWI:(\d+)')
 
 
-def parse_listplayers(text: str) -> list[tuple[str, str]]:
-    """Return [(steam_id, name), ...] for currently-connected players."""
-    return [(sid, name) for name, sid in _LISTPLAYERS_RE.findall(text or "")]
+def parse_listplayers(text: str) -> list[str]:
+    """Return the SteamID64s of currently-connected human players."""
+    return _STEAMID_RE.findall(text or "")
+
+
+def _steam_resolve(steam_ids: list[str]) -> dict[str, str]:
+    """Resolve SteamID64 to the current Steam persona name via the Steam Web API.
+    Batches up to 100 ids per call. Missing/failed ids are simply absent; never
+    raises. With no STEAM_API_KEY set, returns {} (caller falls back to SteamID)."""
+    names: dict[str, str] = {}
+    if not STEAM_API_KEY or not steam_ids:
+        return names
+    for i in range(0, len(steam_ids), 100):        # API caps at 100 ids per call
+        batch = ",".join(steam_ids[i:i + 100])
+        url = ("https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/"
+               f"?key={STEAM_API_KEY}&steamids={batch}")
+        try:
+            with urllib.request.urlopen(url, timeout=TG_HTTP_TIMEOUT) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            for p in data.get("response", {}).get("players", []):
+                names[p["steamid"]] = p.get("personaname", "")
+        except Exception as e:
+            log.warning("Steam API resolve failed: %s", e)
+    return names
 
 
 def seed_cache_from_rcon() -> bool:
     """Seed the cache with currently-connected players via RCON `listplayers`.
-    This is the accurate source (only live players, with names + SteamIDs),
-    unlike scanning the multi-GB log. Returns False if RCON is unavailable.
+    This is the accurate source (only live players), unlike scanning the multi-GB
+    log. Names come from the Steam API. Returns False if RCON is unavailable.
     """
     result = send_rcon("listplayers")
     if result is None:
         return False
-    players = parse_listplayers(result)
-    for steam_id, name in players:
-        cache_add(steam_id, sanitize_name(name))
-    log.info("Seeded cache from RCON listplayers: %d player(s).", len(players))
+    ids = parse_listplayers(result)
+    names = _steam_resolve(ids)
+    for sid in ids:
+        cache_add(sid, sanitize_name(names.get(sid) or f"SteamID:{sid}"))
+    log.info("Seeded cache from RCON listplayers: %d player(s).", len(ids))
     return True
 
 
@@ -215,10 +243,10 @@ def seed_cache_from_rcon() -> bool:
 #
 #  Design: the join/leave events already computed by handle_join /
 #  reconcile_players are the single source of truth. We only add two extra
-#  sinks here — never a second polling path:
+#  sinks here - never a second polling path:
 #    * one NEW message per join/leave (with live count + map), AND
 #    * a SINGLE pinned "board" (server name, count, map, roster) edited in
-#      place — refreshed on every roster/map change;
+#      place - refreshed on every roster/map change;
 #    * a node_exporter textfile metric (iss_players_online) for Grafana.
 #  All Telegram I/O happens on a dedicated worker thread so a slow/broken API
 #  call can never stall the RCON loop or log tailing.
@@ -236,7 +264,7 @@ def map_label() -> str:
 
 def _tg_call(method: str, params: dict) -> dict | None:
     """POST to the Telegram Bot API. Returns the parsed response or None on
-    failure. Never raises — game monitoring must survive Telegram being down."""
+    failure. Never raises - game monitoring must survive Telegram being down."""
     if not TELEGRAM_ENABLED:
         return None
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
@@ -271,7 +299,7 @@ def build_board_text() -> str:
     """Render the pinned status board (Telegram HTML parse mode): server name,
     live count, current map, and the list of connected players."""
     count = player_count()
-    roster = "\n".join(f"• {html.escape(n)}" for n in player_cache.values()) or "<i>empty</i>"
+    roster = "\n".join(f"- {html.escape(n)}" for n in player_cache.values()) or "<i>empty</i>"
     return (
         f"🎮 <b>{html.escape(SERVER_NAME)}</b>\n"
         f"\n"
@@ -293,10 +321,10 @@ def _render_and_edit_board() -> None:
             "chat_id": TELEGRAM_CHAT_ID, "message_id": _board_msg_id,
             "text": text, "parse_mode": "HTML",
         })
-        # "message is not modified" is a benign no-op; anything else → recreate.
+        # "message is not modified" is a benign no-op; anything else -> recreate.
         if r and (r.get("ok") or "not modified" in str(r.get("description", ""))):
             return
-        log.info("Board edit failed (%s) — creating a new board.",
+        log.info("Board edit failed (%s) - creating a new board.",
                  r.get("description") if r else "no response")
         _board_msg_id = None
 
@@ -362,7 +390,7 @@ def write_metrics() -> None:
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(body)
-        os.replace(tmp, METRICS_FILE)      # atomic — node_exporter never reads a partial file
+        os.replace(tmp, METRICS_FILE)      # atomic - node_exporter never reads a partial file
     except Exception as e:
         log.warning("Could not write metrics file %s: %s", METRICS_FILE, e)
 
@@ -381,7 +409,7 @@ def player_event(name: str, action: str) -> None:
 
 
 def roster_refresh() -> None:
-    """Refresh the board + metric WITHOUT announcing — used at startup and for
+    """Refresh the board + metric WITHOUT announcing - used at startup and for
     safety-net reconciliation of players we picked up implicitly."""
     _board_dirty.set()
     write_metrics()
@@ -401,7 +429,7 @@ def handle_crash(line: str, maps_pool: list[str]) -> bool:
         return True
 
     chosen = random.choice(maps_pool)
-    log.warning("Crash detected — travelling to: %s", chosen)
+    log.warning("Crash detected - travelling to: %s", chosen)
     _last_travel_time = now
     send_rcon(f"travelscenario {chosen}")
     return True
@@ -420,11 +448,11 @@ def handle_login(line: str) -> bool:
 
 
 # ProcessServerTravel: <Level>?scenario=Scenario_<Map>_<Mode>_<Side>?...
-# NOTE 1: the game writes the key BOTH ways — "Scenario=" (travelscenario / on
+# NOTE 1: the game writes the key BOTH ways - "Scenario=" (travelscenario / on
 #         boot) and "scenario=" (normal map change). Match case-insensitively
 #         on the key; the value always starts with capital "Scenario_".
 # NOTE 2: the human map name is the Scenario token (e.g. "Tideway"), NOT the
-#         level (e.g. "Buhriz") — they differ for several maps.
+#         level (e.g. "Buhriz") - they differ for several maps.
 # We show map + side (Security / Insurgents); the mode is always Checkpoint.
 _TRAVEL_RE = re.compile(
     r'[Ss]cenario=Scenario_([A-Za-z0-9]+)_([A-Za-z0-9]+)(?:_([A-Za-z0-9]+))?')
@@ -444,12 +472,12 @@ def handle_travel(line: str) -> bool:
         log.info("[MAP] %s", map_label())
         _board_dirty.set()
         write_metrics()
-    log.debug("Map travel observed — pausing leave reconciliation briefly.")
+    log.debug("Map travel observed - pausing leave reconciliation briefly.")
     return True
 
 
 def handle_join(line: str) -> bool:
-    """A successful join only TRIGGERS a prompt reconcile — the actual "joined"
+    """A successful join only TRIGGERS a prompt reconcile - the actual "joined"
     announcement comes from reconcile_players once the player is confirmed in
     listplayers. This avoids announcing arrivals (or the wrong count) before the
     player is really in-session."""
@@ -466,7 +494,15 @@ def _listplayers_online() -> dict[str, str] | None:
     result = send_rcon("listplayers")
     if result is None or "NetID" not in result:
         return None
-    return {sid: name for sid, name in parse_listplayers(result)}
+    ids = parse_listplayers(result)
+    # Reuse cached names; only resolve SteamIDs we haven't seen yet, so a steady
+    # roster makes zero Steam API calls (names are fetched once, on join/seed).
+    # ponytail: mid-game renames aren't re-fetched; add periodic re-resolve only
+    # if that turns out to matter.
+    resolved = _steam_resolve([s for s in ids if s not in player_cache])
+    return {sid: player_cache.get(sid)
+                 or sanitize_name(resolved.get(sid) or f"SteamID:{sid}")
+            for sid in ids}
 
 
 def reconcile_players() -> None:
@@ -474,7 +510,7 @@ def reconcile_players() -> None:
     RCON listplayers (the only authoritative list of who is actually in-session).
 
     This is why a connecting client (a log "Login request" / "Join succeeded")
-    is never announced directly — a player who is mid-handshake or still loading
+    is never announced directly - a player who is mid-handshake or still loading
     the map is not yet in listplayers, and announcing off the log produced
     phantom "left" messages before the player had even arrived. Here a player is
     announced "joined" only once they appear in listplayers, and "left" only
@@ -499,7 +535,7 @@ def reconcile_players() -> None:
         confirm = _listplayers_online()         # second snapshot guards a truncated reply
         if confirm is not None:
             for steam_id in suspects:
-                if steam_id in confirm:         # reappeared — was a transient drop
+                if steam_id in confirm:         # reappeared - was a transient drop
                     continue
                 name = cache_pop(steam_id)
                 log.info("[LEAVE] %s (%s)", name, steam_id)
@@ -569,9 +605,9 @@ def preload_cache(f) -> None:
     log tail.
     """
     if seed_cache_from_rcon():
-        f.seek(0, os.SEEK_END)             # nothing read from file — tail from end
+        f.seek(0, os.SEEK_END)             # nothing read from file - tail from end
         return
-    log.info("listplayers unavailable — falling back to log-tail pre-load.")
+    log.info("listplayers unavailable - falling back to log-tail pre-load.")
     preload_cache_from_tail(f)
 
 
@@ -583,7 +619,7 @@ def seed_map_from_tail(f) -> None:
     try:
         f.seek(0, os.SEEK_END)
         size = f.tell()
-        f.seek(max(0, size - 30 * 1024 * 1024))    # last 30 MB ≈ several map changes
+        f.seek(max(0, size - 30 * 1024 * 1024))    # last 30 MB ~ several map changes
         last = None
         for line in f:
             # keep only real travels (skip "?restart" lines without a scenario)
@@ -641,28 +677,28 @@ def watch_logs() -> None:
                             st = os.stat(LOG_FILE_PATH)
                             # Rotated by replacement: a brand-new file took the path.
                             if st.st_ino != current_inode:
-                                log.info("Log rotation detected (new inode) — reopening file.")
+                                log.info("Log rotation detected (new inode) - reopening file.")
                                 break
                             # Rotated in place: Insurgency Sandstorm copies the log to a
                             # timestamped backup and TRUNCATES Insurgency.log, keeping the
                             # SAME inode. Our read offset is then stranded past EOF and we
                             # would silently stop seeing events. Detect the shrink and reopen.
                             if st.st_size < f.tell():
-                                log.info("Log truncation detected (size %d < pos %d) — reopening file.",
+                                log.info("Log truncation detected (size %d < pos %d) - reopening file.",
                                          st.st_size, f.tell())
                                 break
                         except FileNotFoundError:
-                            log.warning("Log file disappeared — waiting...")
+                            log.warning("Log file disappeared - waiting...")
                             time.sleep(5)
                             break
                         continue
                     process_line(line.rstrip(), maps_pool)
 
         except FileNotFoundError:
-            log.warning("Log file not found: %s — retrying in 10 s...", LOG_FILE_PATH)
+            log.warning("Log file not found: %s - retrying in 10 s...", LOG_FILE_PATH)
             time.sleep(10)
         except Exception as e:
-            log.exception("Unexpected error in watch loop: %s — restarting in 5 s.", e)
+            log.exception("Unexpected error in watch loop: %s - restarting in 5 s.", e)
             time.sleep(5)
 
 
