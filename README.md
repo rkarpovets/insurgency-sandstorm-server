@@ -25,10 +25,13 @@ board, and a Prometheus/Grafana metric.
     snapshot. The naive `is not part of session` line is **not** trusted on its own: it
     repeats for still-connected players and fires for everyone during map travel, which
     otherwise causes false "disconnected" spam and missed real departures.
-  - Player **names** come from the Steam Web API, resolved by SteamID64 (read reliably
-    from `listplayers`) rather than parsed from the ambiguous, `|`-delimited name column.
-    Each name is resolved once and cached, so a steady roster makes no API calls. Without
-    a `STEAM_API_KEY` set, names fall back to `SteamID:<id>`.
+  - Player **names** come from the game log's login lines (the `?Name=` field, read for
+    both **Steam** and **EOS** players and immune to the `|`-in-name problem of the
+    `listplayers` name column). For a Steam player not yet seen in the log (e.g. already
+    connected at startup) the **Steam Web API** resolves the name from their SteamID64 as
+    a fallback; **EOS** players have no such public API. Anything still unresolved shows
+    the raw id. Names are kept in memory only (no database) - a steady roster makes no API
+    calls.
 - **Three notification channels** - all optional and independent (any can be left off):
   - **In-game chat** - `X connected` / `X disconnected` via RCON `say`.
   - **Telegram** - a single *pinned board* (server name, player count, current map, roster)
@@ -59,8 +62,8 @@ board, and a Prometheus/Grafana metric.
 - **Python 3.10+** (uses modern type-union syntax).
 - Python packages: `pip install -r requirements.txt` (`rcon`, `python-dotenv`).
 - RCON enabled on the server (the launch script enables it).
-- *Optional:* a Steam Web API key (`STEAM_API_KEY`) to show player names instead of
-  SteamIDs - free from https://steamcommunity.com/dev/apikey
+- *Optional:* a Steam Web API key (`STEAM_API_KEY`) - a name fallback for Steam players
+  not yet seen in the log - free from https://steamcommunity.com/dev/apikey
 - *Optional:* a Telegram bot + chat for alerts; a node_exporter textfile dir for the metric.
 
 ## Setup
@@ -146,7 +149,7 @@ sudo journalctl -u sandstorm-manager.service -f     # manager (also written to s
 | Gameplay / bots | `Insurgency/Saved/Config/LinuxServer/Game.ini` |
 | Mutators / mods | `server.sh` -> `-Mutators=...`, `-ModList=Mods.txt` |
 | Admins / MOTD | `Insurgency/Config/Server/Admins.txt`, `Motd.txt` |
-| Player name resolution | `.env` -> `STEAM_API_KEY` (optional; without it names show as `SteamID:<id>`) |
+| Player name resolution | Log login lines (Steam + EOS); `.env` -> `STEAM_API_KEY` optional fallback for un-seen Steam players; else raw id |
 | Telegram board & alerts | `.env` -> `TELEGRAM_GAME_TOKEN`, `TELEGRAM_GAME_CHAT_ID` |
 | Grafana player metric | `.env` -> `METRICS_FILE` (node_exporter textfile path) |
 | Manager env path | `ENV_FILE` (defaults to `/home/steam/.env`) |
