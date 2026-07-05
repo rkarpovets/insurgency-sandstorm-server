@@ -25,10 +25,11 @@ RCON_IP          = os.environ.get("RCON_IP")
 RCON_PORT        = int(os.environ.get("RCON_PORT"))
 RCON_PASSWORD    = os.environ.get("RCON_PASSWORD")
 
-# Steam Web API key - resolves SteamID64 to the current persona name. We do NOT
-# trust the listplayers name column ("|" is both the column separator and a legal
-# name character, so it is unparseable when a name contains "|"). Empty key -> names
-# fall back to "SteamID:<id>". Get one at https://steamcommunity.com/dev/apikey
+# Steam Web API key - OPTIONAL fallback. Player names come from the game log's
+# login lines (the "|"-immune "?Name=" field, for Steam AND EOS). This key only
+# names a *Steam* player we have no log line for yet (e.g. one already connected
+# when the manager (re)started); EOS players have no such public API. Empty ->
+# such players show their raw id. Get one at https://steamcommunity.com/dev/apikey
 STEAM_API_KEY    = os.environ.get("STEAM_API_KEY", "").strip()
 
 # --- Game alerts (Telegram board + Grafana metric) - all optional ---
@@ -73,6 +74,10 @@ log = logging.getLogger(__name__)
 
 # State
 player_cache: OrderedDict[str, str] = OrderedDict()
+# Names learned from the log's "Login request" lines, keyed by player id (Steam
+# digits or full EOS token). The primary, "|"-immune name source for BOTH Steam
+# and EOS; in-memory only (the game log is the history, no database needed).
+login_names: OrderedDict[str, str] = OrderedDict()
 _reconcile_pending: bool = False    # a join/session-warning asked for an immediate reconcile
 _last_travel_time: float = 0.0        # last crash-recovery travelscenario we issued
 _last_travel_seen: float = 0.0        # last ProcessServerTravel observed in the log
@@ -186,26 +191,46 @@ def cache_add(steam_id: str, name: str) -> None:
         log.debug("Cache full - evicted %s (%s).", evicted_name, evicted_id)
 
 
-def cache_pop(steam_id: str) -> str:
-    return player_cache.pop(steam_id, f"SteamID:{steam_id}")
+def cache_pop(pid: str) -> str:
+    return player_cache.pop(pid, pid)          # fall back to the raw id
 
 
-# Every human player in listplayers carries "SteamNWI:<steamid64>" (bots show
-# "None:INVALID"). We take ONLY the SteamID - it is unambiguous digits, unlike
-# the "|"-delimited name column - and resolve names via the Steam Web API.
-_STEAMID_RE = re.compile(r'SteamNWI:(\d+)')
+# A player's NetID is "SteamNWI:<digits>" (Steam) or "EOS:<hex>|<hex>" (Epic /
+# console via Epic Online Services); bots show "None:INVALID". We extract only
+# the id TOKEN - unambiguous - never the "|"-delimited name column. Names are
+# resolved separately (log login line, then Steam API; see _resolve_names).
+_NETID = r'SteamNWI:\d+|EOS:[0-9a-fA-F]+\|[0-9a-fA-F]+'
+_NETID_RE = re.compile(_NETID)
+_LOGIN_ID_RE = re.compile(rf'userId:\s*({_NETID})')
+
+
+def _bare_id(token: str) -> str:
+    """Cache key: SteamID64 digits for a Steam token, the full 'EOS:...' token
+    for EOS (Steam ids stay Steam-API-ready; EOS ids stay opaque)."""
+    return token[len("SteamNWI:"):] if token.startswith("SteamNWI:") else token
+
+
+def _login_name_add(pid: str, name: str) -> None:
+    """Record a name learned from a log login line (LRU-bounded, in-memory)."""
+    if pid in login_names:
+        del login_names[pid]
+    login_names[pid] = name
+    while len(login_names) > MAX_CACHE_SIZE:
+        login_names.popitem(last=False)
 
 
 def parse_listplayers(text: str) -> list[str]:
-    """Return the SteamID64s of currently-connected human players."""
-    return _STEAMID_RE.findall(text or "")
+    """Return the ids of connected humans (Steam digits / full EOS token). IDs
+    only - names are resolved separately (log login line, then Steam API)."""
+    return [_bare_id(t) for t in _NETID_RE.findall(text or "")]
 
 
 def _steam_resolve(steam_ids: list[str]) -> dict[str, str]:
     """Resolve SteamID64 to the current Steam persona name via the Steam Web API.
-    Batches up to 100 ids per call. Missing/failed ids are simply absent; never
-    raises. With no STEAM_API_KEY set, returns {} (caller falls back to SteamID)."""
+    Batches up to 100 ids per call. Missing/failed/empty ids are simply absent;
+    EOS ids are never sent; never raises. With no STEAM_API_KEY set, returns {}."""
     names: dict[str, str] = {}
+    steam_ids = [s for s in steam_ids if s.isdigit()]   # never send an EOS id
     if not STEAM_API_KEY or not steam_ids:
         return names
     for i in range(0, len(steam_ids), 100):        # API caps at 100 ids per call
@@ -216,24 +241,34 @@ def _steam_resolve(steam_ids: list[str]) -> dict[str, str]:
             with urllib.request.urlopen(url, timeout=TG_HTTP_TIMEOUT) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             for p in data.get("response", {}).get("players", []):
-                names[p["steamid"]] = p.get("personaname", "")
+                persona = p.get("personaname", "")
+                if persona:
+                    names[p["steamid"]] = sanitize_name(persona)
         except Exception as e:
             log.warning("Steam API resolve failed: %s", e)
     return names
 
 
+def _resolve_names(ids: list[str]) -> dict[str, str]:
+    """Resolve player ids to display names, in priority order:
+    log login name (login_names) -> Steam Web API (Steam ids only) -> raw id.
+    Only ids missing from login_names hit the Steam API."""
+    steam = _steam_resolve([pid for pid in ids if pid not in login_names])
+    return {pid: login_names.get(pid) or steam.get(pid) or pid for pid in ids}
+
+
 def seed_cache_from_rcon() -> bool:
-    """Seed the cache with currently-connected players via RCON `listplayers`.
-    This is the accurate source (only live players), unlike scanning the multi-GB
-    log. Names come from the Steam API. Returns False if RCON is unavailable.
+    """Seed the roster from RCON `listplayers` (accurate: only live players),
+    unlike scanning the multi-GB log. Names come from the log login lines /
+    Steam API (see _resolve_names). Returns False if RCON is unavailable.
     """
     result = send_rcon("listplayers")
     if result is None:
         return False
     ids = parse_listplayers(result)
-    names = _steam_resolve(ids)
-    for sid in ids:
-        cache_add(sid, sanitize_name(names.get(sid) or f"SteamID:{sid}"))
+    names = _resolve_names(ids)
+    for pid in ids:
+        cache_add(pid, names[pid])
     log.info("Seeded cache from RCON listplayers: %d player(s).", len(ids))
     return True
 
@@ -436,14 +471,17 @@ def handle_crash(line: str, maps_pool: list[str]) -> bool:
 
 
 def handle_login(line: str) -> bool:
+    """Learn a connecting player's name from the log into login_names - the
+    primary, "|"-immune name source for BOTH Steam and EOS. Writes only the NAME
+    map, never the roster, so it is safe to run live: joins/leaves are still
+    announced authoritatively by reconcile_players (via listplayers)."""
     if "LogNet: Login request:" not in line:
         return False
-
     name_m = re.search(r'\?Name=(.+?)\s+userId:', line)
-    id_m   = re.search(r'userId:\s*SteamNWI:(\d+)', line)
+    id_m   = _LOGIN_ID_RE.search(line)
     if name_m and id_m:
         raw_name = re.sub(r'\?{2,}\w+=\S+', '', name_m.group(1)).strip()
-        cache_add(id_m.group(1), sanitize_name(raw_name))
+        _login_name_add(_bare_id(id_m.group(1)), sanitize_name(raw_name))
     return True
 
 
@@ -489,20 +527,18 @@ def handle_join(line: str) -> bool:
 
 
 def _listplayers_online() -> dict[str, str] | None:
-    """Return {steam_id: name} of connected players, or None if RCON is down or
+    """Return {player_id: name} of connected players, or None if RCON is down or
     the reply is malformed (missing the expected header)."""
     result = send_rcon("listplayers")
     if result is None or "NetID" not in result:
         return None
     ids = parse_listplayers(result)
-    # Reuse cached names; only resolve SteamIDs we haven't seen yet, so a steady
-    # roster makes zero Steam API calls (names are fetched once, on join/seed).
+    # Reuse cached roster names; resolve only ids we don't already have, so a
+    # steady roster with known names makes zero Steam API calls.
     # ponytail: mid-game renames aren't re-fetched; add periodic re-resolve only
     # if that turns out to matter.
-    resolved = _steam_resolve([s for s in ids if s not in player_cache])
-    return {sid: player_cache.get(sid)
-                 or sanitize_name(resolved.get(sid) or f"SteamID:{sid}")
-            for sid in ids}
+    resolved = _resolve_names([pid for pid in ids if pid not in player_cache])
+    return {pid: player_cache.get(pid) or resolved.get(pid) or pid for pid in ids}
 
 
 def reconcile_players() -> None:
@@ -565,26 +601,24 @@ def handle_session_warning(line: str) -> bool:
     return True
 
 
-# Main loop dispatch. handle_login is deliberately NOT called here: it is used
-# only by the startup tail-preload fallback. Live arrivals are detected
-# authoritatively by reconcile_players (via listplayers), never from the
-# connecting-client log line. handle_crash runs first because it needs maps_pool.
+# Main loop dispatch. handle_login runs here (live) to learn player NAMES from
+# the log into login_names; it never touches the roster, so joins/leaves are
+# still detected authoritatively by reconcile_players (via listplayers).
+# handle_crash runs first because it needs maps_pool.
 def process_line(line: str, maps_pool: list[str]) -> None:
     if handle_crash(line, maps_pool):
         return
-    for handler in (handle_travel, handle_join, handle_session_warning):
+    for handler in (handle_login, handle_travel, handle_join, handle_session_warning):
         if handler(line):
             return
 
 
-def preload_cache_from_tail(f) -> None:
-    """Fallback: populate the cache from the *tail* of the log only.
-
-    Used when RCON is not yet available at startup. The live Insurgency.log can
-    be several GB, so we read at most the last PRELOAD_MAX_BYTES and keep the
-    last PRELOAD_MAX_LINES of that window. Because the log is very verbose, a
-    connected player's login line may already be outside this window, so this is
-    only a best-effort fallback to the authoritative listplayers seed.
+def backfill_names_from_tail(f) -> None:
+    """Backfill login_names from recent "Login request" lines in the log tail, so
+    players already connected at (re)start are named without waiting for them to
+    reconnect. Bounded read (last PRELOAD_MAX_BYTES / PRELOAD_MAX_LINES); a login
+    line older than that window is simply missed. Names only - the live roster
+    still comes from RCON listplayers.
     """
     f.seek(0, os.SEEK_END)
     size = f.tell()
@@ -598,17 +632,20 @@ def preload_cache_from_tail(f) -> None:
 
 
 def preload_cache(f) -> None:
-    """Seed the player cache, then leave the file positioned at EOF for tailing.
-
-    Primary source is RCON `listplayers` (accurate: only live players). If RCON
-    is unavailable (e.g. game server still starting), fall back to scanning the
-    log tail.
+    """Backfill known names from the log tail, then seed the live roster from
+    RCON `listplayers`. Leaves the file positioned at EOF for tailing.
     """
+    backfill_names_from_tail(f)            # fill login_names from recent logins
     if seed_cache_from_rcon():
-        f.seek(0, os.SEEK_END)             # nothing read from file - tail from end
+        f.seek(0, os.SEEK_END)             # roster came from RCON - tail from end
         return
-    log.info("listplayers unavailable - falling back to log-tail pre-load.")
-    preload_cache_from_tail(f)
+    # RCON unavailable: no authoritative roster yet. Best-effort seed from the
+    # names we just learned; reconcile corrects it once RCON returns.
+    # ponytail: can transiently over/under-count until RCON is back.
+    log.info("listplayers unavailable - seeding roster from recent log names.")
+    for pid, name in login_names.items():
+        cache_add(pid, name)
+    f.seek(0, os.SEEK_END)
 
 
 def seed_map_from_tail(f) -> None:
