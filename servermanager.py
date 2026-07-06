@@ -220,9 +220,16 @@ def _login_name_add(pid: str, name: str) -> None:
 
 
 def parse_listplayers(text: str) -> list[str]:
-    """Return the ids of connected humans (Steam digits / full EOS token). IDs
-    only - names are resolved separately (log login line, then Steam API)."""
-    return [_bare_id(t) for t in _NETID_RE.findall(text or "")]
+    """Return one id per listplayers row (Steam digits / full EOS token). The
+    real NetID is the LAST id-token on its line - the Name column precedes it, so
+    a NetID-looking string inside a player's own name can't create a phantom
+    roster entry. IDs only; names are resolved separately (login line, Steam API)."""
+    ids = []
+    for line in (text or "").splitlines():
+        tokens = _NETID_RE.findall(line)
+        if tokens:
+            ids.append(_bare_id(tokens[-1]))
+    return ids
 
 
 def _steam_resolve(steam_ids: list[str]) -> dict[str, str]:
