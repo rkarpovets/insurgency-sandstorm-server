@@ -220,16 +220,11 @@ def _login_name_add(pid: str, name: str) -> None:
 
 
 def parse_listplayers(text: str) -> list[str]:
-    """Return one id per listplayers row (Steam digits / full EOS token). The
-    real NetID is the LAST id-token on its line - the Name column precedes it, so
-    a NetID-looking string inside a player's own name can't create a phantom
-    roster entry. IDs only; names are resolved separately (login line, Steam API)."""
-    ids = []
-    for line in (text or "").splitlines():
-        tokens = _NETID_RE.findall(line)
-        if tokens:
-            ids.append(_bare_id(tokens[-1]))
-    return ids
+    """Return the ids of connected humans (Steam digits / full EOS token). We scan
+    the WHOLE reply for id tokens - listplayers is not reliably one row per line,
+    so any per-line logic would drop players. IDs only; names are resolved
+    separately (log login line, then Steam API)."""
+    return [_bare_id(t) for t in _NETID_RE.findall(text or "")]
 
 
 def _steam_resolve(steam_ids: list[str]) -> dict[str, str]:
@@ -424,9 +419,9 @@ def write_metrics() -> None:
         "# HELP iss_players_max Configured player slots\n"
         "# TYPE iss_players_max gauge\n"
         f"iss_players_max {MAX_PLAYERS}\n"
-        "# HELP iss_map_info Current map (value is always 1)\n"
+        "# HELP iss_map_info Current map and scenario side (value is always 1)\n"
         "# TYPE iss_map_info gauge\n"
-        f'iss_map_info{{map="{_current_map}"}} 1\n'
+        f'iss_map_info{{map="{_current_map}",side="{_current_side or "-"}"}} 1\n'
     )
     tmp = f"{METRICS_FILE}.tmp"
     try:
@@ -712,6 +707,10 @@ def watch_logs() -> None:
                     if _reconcile_pending or time.monotonic() - last_reconcile >= PLAYER_POLL_INTERVAL:
                         _reconcile_pending = False
                         reconcile_players()
+                        # Heartbeat: rewrite the metric file even without changes,
+                        # so its mtime staying still means the manager is dead
+                        # (Grafana alerts on node_textfile_mtime_seconds).
+                        write_metrics()
                         last_reconcile = time.monotonic()
 
                     line = f.readline()
