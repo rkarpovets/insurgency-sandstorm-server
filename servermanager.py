@@ -181,18 +181,18 @@ def load_maps() -> list[str]:
     return maps
 
 
-def cache_add(steam_id: str, name: str) -> None:
+def cache_add(player_id: str, name: str) -> None:
     """Add a player to the cache, evicting oldest entries when over the limit."""
-    if steam_id in player_cache:
-        del player_cache[steam_id]
-    player_cache[steam_id] = name
+    if player_id in player_cache:
+        del player_cache[player_id]
+    player_cache[player_id] = name
     while len(player_cache) > MAX_CACHE_SIZE:
         evicted_id, evicted_name = player_cache.popitem(last=False)
         log.debug("Cache full - evicted %s (%s).", evicted_name, evicted_id)
 
 
-def cache_pop(pid: str) -> str:
-    return player_cache.pop(pid, pid)          # fall back to the raw id
+def cache_pop(player_id: str) -> str:
+    return player_cache.pop(player_id, player_id)      # fall back to the raw id
 
 
 # A player's NetID is "SteamNWI:<digits>" (Steam) or "EOS:<hex>|<hex>" (Epic /
@@ -210,11 +210,11 @@ def _bare_id(token: str) -> str:
     return token[len("SteamNWI:"):] if token.startswith("SteamNWI:") else token
 
 
-def _login_name_add(pid: str, name: str) -> None:
+def _login_name_add(player_id: str, name: str) -> None:
     """Record a name learned from a log login line (LRU-bounded, in-memory)."""
-    if pid in login_names:
-        del login_names[pid]
-    login_names[pid] = name
+    if player_id in login_names:
+        del login_names[player_id]
+    login_names[player_id] = name
     while len(login_names) > MAX_CACHE_SIZE:
         login_names.popitem(last=False)
 
@@ -255,8 +255,8 @@ def _resolve_names(ids: list[str]) -> dict[str, str]:
     """Resolve player ids to display names, in priority order:
     log login name (login_names) -> Steam Web API (Steam ids only) -> raw id.
     Only ids missing from login_names hit the Steam API."""
-    steam = _steam_resolve([pid for pid in ids if pid not in login_names])
-    return {pid: login_names.get(pid) or steam.get(pid) or pid for pid in ids}
+    steam = _steam_resolve([p for p in ids if p not in login_names])
+    return {p: login_names.get(p) or steam.get(p) or p for p in ids}
 
 
 def seed_cache_from_rcon() -> bool:
@@ -269,8 +269,8 @@ def seed_cache_from_rcon() -> bool:
         return False
     ids = parse_listplayers(result)
     names = _resolve_names(ids)
-    for pid in ids:
-        cache_add(pid, names[pid])
+    for player_id in ids:
+        cache_add(player_id, names[player_id])
     log.info("Seeded cache from RCON listplayers: %d player(s).", len(ids))
     return True
 
@@ -539,8 +539,8 @@ def _listplayers_online() -> dict[str, str] | None:
     # steady roster with known names makes zero Steam API calls.
     # ponytail: mid-game renames aren't re-fetched; add periodic re-resolve only
     # if that turns out to matter.
-    resolved = _resolve_names([pid for pid in ids if pid not in player_cache])
-    return {pid: player_cache.get(pid) or resolved.get(pid) or pid for pid in ids}
+    resolved = _resolve_names([p for p in ids if p not in player_cache])
+    return {p: player_cache.get(p) or resolved.get(p) or p for p in ids}
 
 
 def reconcile_players() -> None:
@@ -568,24 +568,24 @@ def reconcile_players() -> None:
         return
 
     # Leaves: cached players no longer in listplayers (confirmed twice).
-    suspects = [sid for sid in player_cache if sid not in online]
+    suspects = [p for p in player_cache if p not in online]
     if suspects:
         confirm = _listplayers_online()         # second snapshot guards a truncated reply
         if confirm is not None:
-            for steam_id in suspects:
-                if steam_id in confirm:         # reappeared - was a transient drop
+            for player_id in suspects:
+                if player_id in confirm:        # reappeared - was a transient drop
                     continue
-                name = cache_pop(steam_id)
-                log.info("[LEAVE] %s (%s)", name, steam_id)
+                name = cache_pop(player_id)
+                log.info("[LEAVE] %s (%s)", name, player_id)
                 send_rcon(f"say {name} disconnected")
                 player_event(name, "left")
 
     # Joins: players now in listplayers that we hadn't recorded yet.
-    for steam_id, name in online.items():
-        if steam_id not in player_cache:
+    for player_id, name in online.items():
+        if player_id not in player_cache:
             name = sanitize_name(name)
-            cache_add(steam_id, name)
-            log.info("[JOIN] %s (%s)", name, steam_id)
+            cache_add(player_id, name)
+            log.info("[JOIN] %s (%s)", name, player_id)
             send_rcon(f"say {name} connected")
             player_event(name, "joined")
 
@@ -645,8 +645,8 @@ def preload_cache(f) -> None:
     # names we just learned; reconcile corrects it once RCON returns.
     # ponytail: can transiently over/under-count until RCON is back.
     log.info("listplayers unavailable - seeding roster from recent log names.")
-    for pid, name in login_names.items():
-        cache_add(pid, name)
+    for player_id, name in login_names.items():
+        cache_add(player_id, name)
     f.seek(0, os.SEEK_END)
 
 
