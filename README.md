@@ -149,10 +149,11 @@ sudo journalctl -u sandstorm-manager.service -f     # manager (also written to s
 | Game mode override | `.env` -> `GAME_MODE` (e.g. `CheckpointHardcore`, adds `?Game=` to the starting map); `MapCycle.txt` -> `Mode="..."` per entry |
 | Per-server config | `servers/<name>/` mirrors the `Insurgency/...` paths; a file there replaces the root one for that server (see `servers/sandstorm-hardcore/`) |
 | Gameplay / bots | `Insurgency/Saved/Config/LinuxServer/Game.ini` |
-| Mutators / mods | `server.sh` -> `-Mutators=...`, `-ModList=Mods.txt` |
+| Mutators / mods | `.env` -> `MUTATORS` (default `ISMCarmory_Legacy,ISMCJumpShoot`), `-ModList=Mods.txt` |
 | Admins / MOTD | `Insurgency/Config/Server/Admins.txt`, `Motd.txt` |
 | Player name resolution | Log login lines (Steam + EOS); `.env` -> `STEAM_API_KEY` optional fallback for un-seen Steam players; else raw id |
 | Telegram board & alerts | `.env` -> `TELEGRAM_GAME_TOKEN`, `TELEGRAM_GAME_CHAT_ID` |
+| Several servers, one board | `.env` -> `SERVER_TAG` (e.g. `[1]`, prefixes join/leave messages) and a shared `BOARD_DIR`: every manager pointing at the same dir renders one pinned board with a section per server, sorted by tag |
 | Grafana player metric | `.env` -> `METRICS_FILE` (node_exporter textfile path); optional `SERVER_ID` adds a `server` label to every metric |
 | Env file path | `ENV_FILE` for both `server.sh` and the manager (defaults to `$HOME/.env` and `/home/steam/.env`) |
 
