@@ -146,6 +146,8 @@ sudo journalctl -u sandstorm-manager.service -f     # manager (also written to s
 | Tick rate | `Insurgency/Saved/Config/LinuxServer/Engine.ini` -> `NetServerMaxTickRate` |
 | Map rotation | `Insurgency/Config/Server/MapCycle.txt` |
 | Starting map | `server.sh` -> `-ModDownloadTravelTo=<Map>?Scenario=<Scenario>` |
+| Game mode override | `.env` -> `GAME_MODE` (e.g. `CheckpointHardcore`, adds `?Game=` to the starting map); `MapCycle.txt` -> `Mode="..."` per entry |
+| Per-server config | `servers/<name>/` mirrors the `Insurgency/...` paths; a file there replaces the root one for that server (see `servers/sandstorm-hardcore/`) |
 | Gameplay / bots | `Insurgency/Saved/Config/LinuxServer/Game.ini` |
 | Mutators / mods | `server.sh` -> `-Mutators=...`, `-ModList=Mods.txt` |
 | Admins / MOTD | `Insurgency/Config/Server/Admins.txt`, `Motd.txt` |
