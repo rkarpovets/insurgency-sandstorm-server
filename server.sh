@@ -13,7 +13,7 @@ if [ -z "$SERVER_NAME" ]; then
 fi
 
 ./Insurgency/Binaries/Linux/InsurgencyServer-Linux-Shipping \
-  -ModDownloadTravelTo=Buhriz?Scenario=Scenario_Tideway_Checkpoint_Security?MaxPlayers=$MAX_PLAYERS \
+  -ModDownloadTravelTo=Buhriz?Scenario=Scenario_Tideway_Checkpoint_Security${GAME_MODE:+?Game=$GAME_MODE}?MaxPlayers=$MAX_PLAYERS \
   -hostname="$SERVER_NAME" \
   -Port=$GAME_PORT \
   -QueryPort=$QUERY_PORT \
