@@ -43,6 +43,7 @@ MAX_PLAYERS      = int(os.environ.get("MAX_PLAYERS", "16"))
 BOARD_STATE_FILE = os.environ.get("BOARD_STATE_FILE", "board_message_id.txt")
 # node_exporter textfile-collector target. Empty -> don't write the metric.
 METRICS_FILE     = os.environ.get("METRICS_FILE", "").strip()
+SERVER_ID        = os.environ.get("SERVER_ID", "").strip()
 
 TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
 
@@ -408,6 +409,13 @@ def telegram_worker() -> None:
         time.sleep(BOARD_DEBOUNCE)
 
 
+def _metric_labels(**labels: str) -> str:
+    pairs = ({"server": SERVER_ID} if SERVER_ID else {}) | labels
+    if not pairs:
+        return ""
+    return "{" + ",".join(f'{k}="{v}"' for k, v in pairs.items()) + "}"
+
+
 def write_metrics() -> None:
     """Atomically write the node_exporter textfile metric for Grafana."""
     if not METRICS_FILE:
@@ -415,13 +423,13 @@ def write_metrics() -> None:
     body = (
         "# HELP iss_players_online Players currently connected\n"
         "# TYPE iss_players_online gauge\n"
-        f"iss_players_online {player_count()}\n"
+        f"iss_players_online{_metric_labels()} {player_count()}\n"
         "# HELP iss_players_max Configured player slots\n"
         "# TYPE iss_players_max gauge\n"
-        f"iss_players_max {MAX_PLAYERS}\n"
+        f"iss_players_max{_metric_labels()} {MAX_PLAYERS}\n"
         "# HELP iss_map_info Current map and scenario side (value is always 1)\n"
         "# TYPE iss_map_info gauge\n"
-        f'iss_map_info{{map="{_current_map}",side="{_current_side or "-"}"}} 1\n'
+        f'iss_map_info{_metric_labels(map=_current_map, side=_current_side or "-")} 1\n'
     )
     tmp = f"{METRICS_FILE}.tmp"
     try:

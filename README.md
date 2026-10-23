@@ -151,8 +151,8 @@ sudo journalctl -u sandstorm-manager.service -f     # manager (also written to s
 | Admins / MOTD | `Insurgency/Config/Server/Admins.txt`, `Motd.txt` |
 | Player name resolution | Log login lines (Steam + EOS); `.env` -> `STEAM_API_KEY` optional fallback for un-seen Steam players; else raw id |
 | Telegram board & alerts | `.env` -> `TELEGRAM_GAME_TOKEN`, `TELEGRAM_GAME_CHAT_ID` |
-| Grafana player metric | `.env` -> `METRICS_FILE` (node_exporter textfile path) |
-| Manager env path | `ENV_FILE` (defaults to `/home/steam/.env`) |
+| Grafana player metric | `.env` -> `METRICS_FILE` (node_exporter textfile path); optional `SERVER_ID` adds a `server` label to every metric |
+| Env file path | `ENV_FILE` for both `server.sh` and the manager (defaults to `$HOME/.env` and `/home/steam/.env`) |
 
 **Tick rate vs. capacity.** `NetServerMaxTickRate` drives the most expensive (replication +
 simulation) load. 60 is the standard tick; 120 roughly doubles CPU cost. Lower it before
