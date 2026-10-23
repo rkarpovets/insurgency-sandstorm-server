@@ -1,13 +1,14 @@
 #!/bin/bash
+ENV_FILE="${ENV_FILE:-$HOME/.env}"
 set -a
-source "$HOME/.env"
+source "$ENV_FILE"
 set +a
 
 # Never launch with an empty hostname: the engine's command-line parser then
 # takes the NEXT argument as the server name - which once put the private token
 # on public server trackers. An empty name means .env is broken; refuse to start.
 if [ -z "$SERVER_NAME" ]; then
-    echo "FATAL: SERVER_NAME is empty - check $HOME/.env quoting" >&2
+    echo "FATAL: SERVER_NAME is empty - check $ENV_FILE quoting" >&2
     exit 1
 fi
 
