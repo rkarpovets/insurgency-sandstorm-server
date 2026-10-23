@@ -27,4 +27,4 @@ fi
   -GameStatsToken=$GAMESTATS_TOKEN \
   -MapCycle -AdminList -motd \
   -mods -ModList=Mods.txt \
-  -Mutators=ISMCarmory_Legacy,ISMCJumpShoot
+  -Mutators=${MUTATORS:-ISMCarmory_Legacy,ISMCJumpShoot}

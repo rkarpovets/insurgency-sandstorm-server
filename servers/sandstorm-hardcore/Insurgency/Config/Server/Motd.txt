@@ -4,6 +4,12 @@
 - Bots: 8 up to 22
 - Increased capture and defending time
 - Modified AI difficulty
+- Hardcore Checkpoint
+- 1 supply crate at a random objective + 1 at the final objective
+- Commander loses binoculars on death
+
+Quick tip: better pick a shotgun or an SMG instead of a pistol as your secondary.
+After death you respawn with only your secondary weapon and minimal ammo.
 
 Location: Germany
 

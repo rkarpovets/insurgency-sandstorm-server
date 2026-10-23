@@ -2,6 +2,7 @@ import time
 import os
 import random
 import re
+import fcntl
 import html
 import json
 import queue
@@ -44,6 +45,9 @@ BOARD_STATE_FILE = os.environ.get("BOARD_STATE_FILE", "board_message_id.txt")
 # node_exporter textfile-collector target. Empty -> don't write the metric.
 METRICS_FILE     = os.environ.get("METRICS_FILE", "").strip()
 SERVER_ID        = os.environ.get("SERVER_ID", "").strip()
+SERVER_TAG       = os.environ.get("SERVER_TAG", "").strip()
+BOARD_DIR        = os.environ.get("BOARD_DIR", "").strip()
+BOARD_OFFLINE_AFTER = 600
 
 TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
 
@@ -333,53 +337,137 @@ def _save_board_id(msg_id: int) -> None:
         log.warning("Could not persist board message id: %s", e)
 
 
-def build_board_text() -> str:
-    """Render the pinned status board (Telegram HTML parse mode): server name,
-    live count, current map, and the list of connected players."""
-    count = player_count()
-    roster = "\n".join(f"- {html.escape(n)}" for n in player_cache.values()) or "<i>empty</i>"
+def _own_board_state() -> dict:
+    return {
+        "tag": SERVER_TAG,
+        "name": SERVER_NAME,
+        "count": player_count(),
+        "max": MAX_PLAYERS,
+        "map": map_label(),
+        "players": list(player_cache.values()),
+        "seen": time.time(),
+    }
+
+
+def _board_section(state: dict) -> str:
+    title = " ".join(p for p in (state.get("tag", ""), state.get("name", "")) if p)
+    if time.time() - state.get("seen", 0) > BOARD_OFFLINE_AFTER:
+        title += " (offline)"
+    roster = "\n".join(f"- {html.escape(n)}" for n in state.get("players", [])) or "<i>empty</i>"
     return (
-        f"🎮 <b>{html.escape(SERVER_NAME)}</b>\n"
+        f"🎮 <b>{html.escape(title)}</b>\n"
         f"\n"
-        f"👥 Players: <b>{count}/{MAX_PLAYERS}</b>\n"
-        f"🗺️ Map: <b>{html.escape(map_label())}</b>\n"
+        f"👥 Players: <b>{state.get('count', 0)}/{state.get('max', 0)}</b>\n"
+        f"🗺️ Map: <b>{html.escape(state.get('map', '-'))}</b>\n"
         f"\n"
-        f"{roster}\n"
-        f"\n"
-        f"<i>updated {time.strftime('%-d %b %Y %H:%M', time.gmtime())} UTC</i>"
+        f"{roster}"
     )
 
 
-def _render_and_edit_board() -> None:
-    """Edit the pinned board in place; (re)create + pin it if needed."""
-    global _board_msg_id
-    text = build_board_text()
-    if _board_msg_id is not None:
+def _board_footer() -> str:
+    return f"<i>updated {time.strftime('%-d %b %Y %H:%M', time.gmtime())} UTC</i>"
+
+
+def build_board_text() -> str:
+    """Render the pinned status board (Telegram HTML parse mode): server name,
+    live count, current map, and the list of connected players."""
+    return f"{_board_section(_own_board_state())}\n\n{_board_footer()}"
+
+
+def _publish_board(msg_id: int | None, text: str) -> int | None:
+    if msg_id is not None:
         r = _tg_call("editMessageText", {
-            "chat_id": TELEGRAM_CHAT_ID, "message_id": _board_msg_id,
+            "chat_id": TELEGRAM_CHAT_ID, "message_id": msg_id,
             "text": text, "parse_mode": "HTML",
         })
         # "message is not modified" is a benign no-op; anything else -> recreate.
         if r and (r.get("ok") or "not modified" in str(r.get("description", ""))):
-            return
+            return msg_id
         log.info("Board edit failed (%s) - creating a new board.",
                  r.get("description") if r else "no response")
-        _board_msg_id = None
 
     r = _tg_call("sendMessage", {
         "chat_id": TELEGRAM_CHAT_ID, "text": text,
         "parse_mode": "HTML", "disable_notification": "true",
     })
     if r and r.get("ok"):
-        _board_msg_id = r["result"]["message_id"]
-        _save_board_id(_board_msg_id)
+        msg_id = r["result"]["message_id"]
         _tg_call("pinChatMessage", {
-            "chat_id": TELEGRAM_CHAT_ID, "message_id": _board_msg_id,
+            "chat_id": TELEGRAM_CHAT_ID, "message_id": msg_id,
             "disable_notification": "true",
         })
-    else:
-        log.warning("Board sendMessage failed: %s",
-                    r.get("description") if r else "no response")
+        return msg_id
+    log.warning("Board sendMessage failed: %s",
+                r.get("description") if r else "no response")
+    return None
+
+
+def _render_and_edit_board() -> None:
+    """Edit the pinned board in place; (re)create + pin it if needed."""
+    global _board_msg_id
+    if BOARD_DIR:
+        _render_shared_board()
+        return
+    msg_id = _publish_board(_board_msg_id, build_board_text())
+    if msg_id is not None and msg_id != _board_msg_id:
+        _save_board_id(msg_id)
+    _board_msg_id = msg_id
+
+
+def _read_text(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+
+def _write_text(path: str, text: str) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def _render_shared_board() -> None:
+    _write_text(os.path.join(BOARD_DIR, f"{SERVER_ID or 'server'}.json"),
+                json.dumps(_own_board_state()))
+    with open(os.path.join(BOARD_DIR, ".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        states = []
+        for name in sorted(os.listdir(BOARD_DIR)):
+            if name.endswith(".json"):
+                try:
+                    states.append(json.loads(_read_text(os.path.join(BOARD_DIR, name))))
+                except ValueError:
+                    continue
+        states.sort(key=lambda s: (s.get("tag") or "~", s.get("name", "")))
+        body = "\n\n".join(_board_section(s) for s in states)
+        id_path = os.path.join(BOARD_DIR, "message_id")
+        body_path = os.path.join(BOARD_DIR, "last_body")
+        stored_id = _read_text(id_path).strip()
+        msg_id = int(stored_id) if stored_id.isdigit() else None
+        if msg_id is not None and body == _read_text(body_path):
+            return
+        new_id = _publish_board(msg_id, f"{body}\n\n{_board_footer()}")
+        if new_id is not None:
+            _write_text(id_path, str(new_id))
+            _write_text(body_path, body)
+
+
+def _retire_single_board() -> None:
+    global _board_msg_id
+    _load_board_id()
+    if _board_msg_id is None:
+        return
+    old_id, _board_msg_id = _board_msg_id, None
+    r = _tg_call("deleteMessage", {"chat_id": TELEGRAM_CHAT_ID, "message_id": old_id})
+    if not (r and r.get("ok")):
+        _tg_call("unpinChatMessage", {"chat_id": TELEGRAM_CHAT_ID, "message_id": old_id})
+    try:
+        os.remove(BOARD_STATE_FILE)
+    except OSError as e:
+        log.warning("Could not remove %s: %s", BOARD_STATE_FILE, e)
 
 
 def notify_event(text: str) -> None:
@@ -445,8 +533,9 @@ def player_event(name: str, action: str) -> None:
     and the Grafana metric. `action` is 'joined' or 'left'. The count already
     reflects this event (join: added on Login; leave: popped before this call)."""
     count = player_count()
+    tag = f"{html.escape(SERVER_TAG)} " if SERVER_TAG else ""
     notify_event(
-        f"<b>{html.escape(name)}</b> {action} the server\n"
+        f"{tag}<b>{html.escape(name)}</b> {action} the server\n"
         f"{count}/{MAX_PLAYERS} - {html.escape(map_label())}"
     )
     _board_dirty.set()
@@ -690,7 +779,10 @@ def watch_logs() -> None:
     log.info("Monitoring: %s", LOG_FILE_PATH)
 
     if TELEGRAM_ENABLED:
-        _load_board_id()
+        if BOARD_DIR:
+            _retire_single_board()
+        else:
+            _load_board_id()
         threading.Thread(target=telegram_worker, daemon=True).start()
         log.info("Telegram game alerts enabled (chat %s).", TELEGRAM_CHAT_ID)
     else:
@@ -719,6 +811,8 @@ def watch_logs() -> None:
                         # so its mtime staying still means the manager is dead
                         # (Grafana alerts on node_textfile_mtime_seconds).
                         write_metrics()
+                        if BOARD_DIR:
+                            _board_dirty.set()
                         last_reconcile = time.monotonic()
 
                     line = f.readline()
