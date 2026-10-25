@@ -10,6 +10,7 @@ import logging
 import signal
 import sys
 import threading
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import OrderedDict
@@ -48,8 +49,11 @@ SERVER_ID        = os.environ.get("SERVER_ID", "").strip()
 SERVER_TAG       = os.environ.get("SERVER_TAG", "").strip()
 BOARD_DIR        = os.environ.get("BOARD_DIR", "").strip()
 BOARD_OFFLINE_AFTER = 600
+DISCORD_BOARD_WEBHOOK  = os.environ.get("DISCORD_BOARD_WEBHOOK", "").strip().rstrip("/")
+DISCORD_EVENTS_WEBHOOK = os.environ.get("DISCORD_EVENTS_WEBHOOK", "").strip().rstrip("/")
 
 TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
+DISCORD_ENABLED  = bool(DISCORD_BOARD_WEBHOOK or DISCORD_EVENTS_WEBHOOK)
 
 TRAVEL_COOLDOWN  = 30        # seconds to ignore further crash triggers after a travelscenario
 MAX_CACHE_SIZE   = 5000      # max players kept in memory (big enough that long-connected
@@ -65,6 +69,12 @@ BOARD_DEBOUNCE   = 2.0      # seconds the Telegram worker coalesces rapid roster
                             # changes into a single board edit (avoids API spam
                             # when a full server reconnects after a map change)
 TG_HTTP_TIMEOUT  = 10.0     # seconds for any Telegram API call
+DISCORD_HTTP_TIMEOUT = 10.0
+DISCORD_RETRIES  = 3
+DISCORD_USER_AGENT = "DiscordBot (https://github.com/rkarpovets/insurgency-sandstorm-server, 1.0)"
+DISCORD_COLOR_PLAYERS = 0x2ECC71
+DISCORD_COLOR_EMPTY   = 0x5865F2
+DISCORD_COLOR_OFFLINE = 0x95A5A6
 
 # Logging
 logging.basicConfig(
@@ -92,7 +102,7 @@ _current_map: str = "-"               # human map name (Scenario token, not the 
 _current_side: str = ""               # team/side of the scenario (Security / Insurgents)
 _board_msg_id: int | None = None      # pinned Telegram board message to edit in place
 _board_dirty = threading.Event()      # set when the board needs a refresh
-_event_queue: "queue.Queue[str]" = queue.Queue()  # join/leave messages to send
+_event_queue: "queue.Queue[tuple[str, str, int, str]]" = queue.Queue()  # join/leave events to send
 
 
 # Graceful shutdown
@@ -349,10 +359,17 @@ def _own_board_state() -> dict:
     }
 
 
-def _board_section(state: dict) -> str:
+def _board_offline(state: dict) -> bool:
+    return time.time() - state.get("seen", 0) > BOARD_OFFLINE_AFTER
+
+
+def _board_title(state: dict) -> str:
     title = " ".join(p for p in (state.get("tag", ""), state.get("name", "")) if p)
-    if time.time() - state.get("seen", 0) > BOARD_OFFLINE_AFTER:
-        title += " (offline)"
+    return f"{title} (offline)" if _board_offline(state) else title
+
+
+def _board_section(state: dict) -> str:
+    title = _board_title(state)
     roster = "\n".join(f"- {html.escape(n)}" for n in state.get("players", [])) or "<i>empty</i>"
     return (
         f"🎮 <b>{html.escape(title)}</b>\n"
@@ -408,10 +425,14 @@ def _render_and_edit_board() -> None:
     if BOARD_DIR:
         _render_shared_board()
         return
-    msg_id = _publish_board(_board_msg_id, build_board_text())
-    if msg_id is not None and msg_id != _board_msg_id:
-        _save_board_id(msg_id)
-    _board_msg_id = msg_id
+    if TELEGRAM_ENABLED:
+        msg_id = _publish_board(_board_msg_id, build_board_text())
+        if msg_id is not None and msg_id != _board_msg_id:
+            _save_board_id(msg_id)
+        _board_msg_id = msg_id
+    if DISCORD_BOARD_WEBHOOK:
+        _sync_discord_board([_own_board_state()],
+                            os.path.dirname(os.path.abspath(BOARD_STATE_FILE)))
 
 
 def _read_text(path: str) -> str:
@@ -442,17 +463,106 @@ def _render_shared_board() -> None:
                 except ValueError:
                     continue
         states.sort(key=lambda s: (s.get("tag") or "~", s.get("name", "")))
-        body = "\n\n".join(_board_section(s) for s in states)
-        id_path = os.path.join(BOARD_DIR, "message_id")
-        body_path = os.path.join(BOARD_DIR, "last_body")
-        stored_id = _read_text(id_path).strip()
-        msg_id = int(stored_id) if stored_id.isdigit() else None
-        if msg_id is not None and body == _read_text(body_path):
-            return
-        new_id = _publish_board(msg_id, f"{body}\n\n{_board_footer()}")
-        if new_id is not None:
-            _write_text(id_path, str(new_id))
-            _write_text(body_path, body)
+        if TELEGRAM_ENABLED:
+            _sync_telegram_board(states)
+        if DISCORD_BOARD_WEBHOOK:
+            _sync_discord_board(states, BOARD_DIR)
+
+
+def _sync_telegram_board(states: list[dict]) -> None:
+    body = "\n\n".join(_board_section(s) for s in states)
+    id_path = os.path.join(BOARD_DIR, "message_id")
+    body_path = os.path.join(BOARD_DIR, "last_body")
+    stored_id = _read_text(id_path).strip()
+    msg_id = int(stored_id) if stored_id.isdigit() else None
+    if msg_id is not None and body == _read_text(body_path):
+        return
+    new_id = _publish_board(msg_id, f"{body}\n\n{_board_footer()}")
+    if new_id is not None:
+        _write_text(id_path, str(new_id))
+        _write_text(body_path, body)
+
+
+_MD_SPECIAL = re.compile(r"([\\*_~`|>#<:\[\]()-])")
+
+
+def _md_escape(text: str) -> str:
+    return _MD_SPECIAL.sub(r"\\\1", text)
+
+
+def _discord_call(url: str, method: str, payload: dict) -> tuple[int, dict | None]:
+    data = json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json", "User-Agent": DISCORD_USER_AGENT}
+    for _ in range(DISCORD_RETRIES):
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers, method=method)
+            with urllib.request.urlopen(req, timeout=DISCORD_HTTP_TIMEOUT) as resp:
+                raw = resp.read()
+                return resp.status, json.loads(raw) if raw else None
+        except urllib.error.HTTPError as e:
+            if e.code != 429:
+                log.warning("Discord %s failed: HTTP %s", method, e.code)
+                return e.code, None
+            try:
+                wait = float(json.loads(e.read()).get("retry_after", 1))
+            except (ValueError, AttributeError):
+                wait = 1.0
+            time.sleep(min(wait, 10.0))
+        except Exception as e:
+            log.warning("Discord %s failed: %s", method, e)
+            return 0, None
+    log.warning("Discord %s gave up after %d rate-limited attempts.", method, DISCORD_RETRIES)
+    return 429, None
+
+
+def _discord_embed(state: dict) -> dict:
+    players = state.get("players", [])
+    if _board_offline(state):
+        color = DISCORD_COLOR_OFFLINE
+    elif state.get("count", 0):
+        color = DISCORD_COLOR_PLAYERS
+    else:
+        color = DISCORD_COLOR_EMPTY
+    return {
+        "title": _board_title(state)[:256],
+        "color": color,
+        "description": ("\n".join(f"- {_md_escape(n)}" for n in players) or "*empty*")[:4096],
+        "fields": [
+            {"name": "Players", "value": f"{state.get('count', 0)}/{state.get('max', 0)}",
+             "inline": True},
+            {"name": "Map", "value": _md_escape(state.get("map", "-")) or "-", "inline": True},
+        ],
+    }
+
+
+def _publish_discord_board(msg_id: str | None, embeds: list[dict]) -> str | None:
+    payload = {"embeds": embeds, "allowed_mentions": {"parse": []}}
+    if msg_id:
+        status, _ = _discord_call(f"{DISCORD_BOARD_WEBHOOK}/messages/{msg_id}", "PATCH", payload)
+        if status != 404:
+            return msg_id if 200 <= status < 300 else None
+        log.info("Discord board message is gone - creating a new one.")
+    status, body = _discord_call(f"{DISCORD_BOARD_WEBHOOK}?wait=true", "POST", payload)
+    if 200 <= status < 300 and body and str(body.get("id", "")).isdigit():
+        return str(body["id"])
+    return None
+
+
+def _sync_discord_board(states: list[dict], store_dir: str) -> None:
+    embeds = [_discord_embed(s) for s in states]
+    body = json.dumps(embeds, sort_keys=True)
+    id_path = os.path.join(store_dir, "discord_message_id")
+    body_path = os.path.join(store_dir, "discord_last_body")
+    stored_id = _read_text(id_path).strip()
+    msg_id = stored_id if stored_id.isdigit() else None
+    if msg_id is not None and body == _read_text(body_path):
+        return
+    embeds[-1]["footer"] = {"text": "updated"}
+    embeds[-1]["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    new_id = _publish_discord_board(msg_id, embeds)
+    if new_id is not None:
+        _write_text(id_path, new_id)
+        _write_text(body_path, body)
 
 
 def _retire_single_board() -> None:
@@ -470,22 +580,45 @@ def _retire_single_board() -> None:
         log.warning("Could not remove %s: %s", BOARD_STATE_FILE, e)
 
 
-def notify_event(text: str) -> None:
+def notify_event(name: str, action: str, count: int, map_name: str) -> None:
     """Queue a join/leave message (sent as its own message). Non-blocking."""
-    if TELEGRAM_ENABLED:
-        _event_queue.put(text)
+    if TELEGRAM_ENABLED or DISCORD_EVENTS_WEBHOOK:
+        _event_queue.put((name, action, count, map_name))
 
 
-def telegram_worker() -> None:
+def _telegram_event_text(name: str, action: str, count: int, map_name: str) -> str:
+    tag = f"{html.escape(SERVER_TAG)} " if SERVER_TAG else ""
+    return (
+        f"{tag}<b>{html.escape(name)}</b> {action} the server\n"
+        f"{count}/{MAX_PLAYERS} - {html.escape(map_name)}"
+    )
+
+
+def _discord_event_text(name: str, action: str, count: int, map_name: str) -> str:
+    tag = f"{_md_escape(SERVER_TAG)} " if SERVER_TAG else ""
+    return (
+        f"{tag}**{_md_escape(name)}** {action} the server\n"
+        f"{count}/{MAX_PLAYERS} - {_md_escape(map_name)}"
+    )
+
+
+def alerts_worker() -> None:
     """Single background thread: sends queued join/leave messages and refreshes
     the board at most every BOARD_DEBOUNCE seconds (coalesces bursts)."""
     while True:
         try:
             while True:
-                msg = _event_queue.get_nowait()
-                _tg_call("sendMessage", {
-                    "chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML",
-                })
+                event = _event_queue.get_nowait()
+                if TELEGRAM_ENABLED:
+                    _tg_call("sendMessage", {
+                        "chat_id": TELEGRAM_CHAT_ID, "text": _telegram_event_text(*event),
+                        "parse_mode": "HTML",
+                    })
+                if DISCORD_EVENTS_WEBHOOK:
+                    _discord_call(DISCORD_EVENTS_WEBHOOK, "POST", {
+                        "content": _discord_event_text(*event),
+                        "allowed_mentions": {"parse": []},
+                    })
         except queue.Empty:
             pass
         if _board_dirty.is_set():
@@ -532,12 +665,7 @@ def player_event(name: str, action: str) -> None:
     """Announce a join/leave as its OWN message, then refresh the pinned board
     and the Grafana metric. `action` is 'joined' or 'left'. The count already
     reflects this event (join: added on Login; leave: popped before this call)."""
-    count = player_count()
-    tag = f"{html.escape(SERVER_TAG)} " if SERVER_TAG else ""
-    notify_event(
-        f"{tag}<b>{html.escape(name)}</b> {action} the server\n"
-        f"{count}/{MAX_PLAYERS} - {html.escape(map_label())}"
-    )
+    notify_event(name, action, player_count(), map_label())
     _board_dirty.set()
     write_metrics()
 
@@ -783,10 +911,14 @@ def watch_logs() -> None:
             _retire_single_board()
         else:
             _load_board_id()
-        threading.Thread(target=telegram_worker, daemon=True).start()
         log.info("Telegram game alerts enabled (chat %s).", TELEGRAM_CHAT_ID)
     else:
         log.info("Telegram game alerts disabled (no token/chat set).")
+    log.info("Discord board %s, Discord events %s.",
+             "enabled" if DISCORD_BOARD_WEBHOOK else "disabled",
+             "enabled" if DISCORD_EVENTS_WEBHOOK else "disabled")
+    if TELEGRAM_ENABLED or DISCORD_ENABLED:
+        threading.Thread(target=alerts_worker, daemon=True).start()
 
     while True:
         try:
