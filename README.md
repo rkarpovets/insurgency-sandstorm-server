@@ -4,7 +4,7 @@ Configuration and tooling for a co-op (**Checkpoint**) *Insurgency: Sandstorm* d
 server running the **ISMC** mod. The centrepiece is `servermanager.py` - a small,
 dependency-light watcher that keeps the server healthy (recovering from the end-of-match
 map-vote freeze) and surfaces live player activity to in-game chat, a pinned Telegram
-board, and a Prometheus/Grafana metric.
+board, a Discord status channel, and a Prometheus/Grafana metric.
 
 > Provisioned in production by a separate Infrastructure-as-Code repo,
 > [server-infrastructure](https://github.com/rkarpovets/server-infrastructure): this repo
@@ -32,13 +32,19 @@ board, and a Prometheus/Grafana metric.
     a fallback; **EOS** players have no such public API. Anything still unresolved shows
     the raw id. Names are kept in memory only (no database) - a steady roster makes no API
     calls.
-- **Three notification channels** - all optional and independent (any can be left off):
+- **Four notification channels** - all optional and independent (any can be left off):
   - **In-game chat** - `X connected` / `X disconnected` via RCON `say`.
   - **Telegram** - a single *pinned board* (server name, player count, current map, roster)
     edited in place, never spamming new messages: the board's message id is persisted
     (`BOARD_STATE_FILE`) so restarts reuse it. Plus a one-off message per join/leave. All
     Telegram I/O runs on a dedicated, debounced worker thread, so a slow or broken Telegram
     API can never stall game monitoring.
+  - **Discord** - the same board as embed cards (one per server: green with players,
+    blue when empty, grey when offline) edited in place through a webhook, and the same
+    join/leave messages through a second webhook - typically a read-only `#server-status`
+    channel and an `#activity` channel. Mentions are disabled, so a player named
+    `@everyone` pings nobody. Webhooks cannot pin, which is why the board gets its own
+    channel; if someone deletes it, the next update posts a fresh one.
   - **Prometheus metric** - atomically writes `iss_players_online`, `iss_players_max` and
     `iss_map_info` to a node_exporter textfile (`METRICS_FILE`), which Grafana graphs
     against CPU load.
@@ -64,7 +70,8 @@ board, and a Prometheus/Grafana metric.
 - RCON enabled on the server (the launch script enables it).
 - *Optional:* a Steam Web API key (`STEAM_API_KEY`) - a name fallback for Steam players
   not yet seen in the log - free from https://steamcommunity.com/dev/apikey
-- *Optional:* a Telegram bot + chat for alerts; a node_exporter textfile dir for the metric.
+- *Optional:* a Telegram bot + chat and/or Discord channel webhooks for alerts; a
+  node_exporter textfile dir for the metric.
 
 ## Setup
 1. Place these files in your server directory (e.g. `/home/steam/sandstorm_server`).
@@ -73,7 +80,7 @@ board, and a Prometheus/Grafana metric.
    cp .env.example /home/steam/.env     # or wherever ENV_FILE points
    # edit .env: RCON_IP / RCON_PORT / RCON_PASSWORD, GSLT & GameStats tokens,
    #            LOG_FILE_PATH, MAPCYCLE_FILE, and (optional) STEAM_API_KEY /
-   #            TELEGRAM_* / METRICS_FILE
+   #            TELEGRAM_* / DISCORD_* / METRICS_FILE
    ```
 3. Review the gameplay config - `Insurgency/Saved/Config/LinuxServer/Game.ini` and
    `Engine.ini` ship with sensible defaults; edit to taste. (Secrets stay in `.env`, never
@@ -153,6 +160,7 @@ sudo journalctl -u sandstorm-manager.service -f     # manager (also written to s
 | Admins / MOTD | `Insurgency/Config/Server/Admins.txt`, `Motd.txt` |
 | Player name resolution | Log login lines (Steam + EOS); `.env` -> `STEAM_API_KEY` optional fallback for un-seen Steam players; else raw id |
 | Telegram board & alerts | `.env` -> `TELEGRAM_GAME_TOKEN`, `TELEGRAM_GAME_CHAT_ID` |
+| Discord board & alerts | `.env` -> `DISCORD_BOARD_WEBHOOK`, `DISCORD_EVENTS_WEBHOOK` (Channel Settings -> Integrations -> Webhooks); the board message id lives next to `BOARD_STATE_FILE`, or in `BOARD_DIR` when shared |
 | Several servers, one board | `.env` -> `SERVER_TAG` (e.g. `[1]`, prefixes join/leave messages) and a shared `BOARD_DIR`: every manager pointing at the same dir renders one pinned board with a section per server, sorted by tag |
 | Grafana player metric | `.env` -> `METRICS_FILE` (node_exporter textfile path); optional `SERVER_ID` adds a `server` label to every metric |
 | Env file path | `ENV_FILE` for both `server.sh` and the manager (defaults to `$HOME/.env` and `/home/steam/.env`) |
@@ -170,7 +178,8 @@ runtime with RCON `travelscenario <Scenario>` - that resolves the level itself.
 
 ## Notes
 - `.env` and the engine-generated configs are git-ignored - **never commit secrets** (RCON
-  password, GSLT/GameStats tokens, Telegram token).
+  password, GSLT/GameStats tokens, Telegram token, Discord webhook URLs - the URL is the
+  credential).
 - `Insurgency.log` grows very fast (multiple GB/day on a busy server) and is only rotated on
   restart - set up a size-capped cleanup (e.g. a small cron/systemd-timer that prunes old
   `Insurgency-backup-*.log` files) so it doesn't fill the disk.
