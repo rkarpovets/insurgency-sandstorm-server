@@ -33,7 +33,9 @@ board, a Discord status channel, and a Prometheus/Grafana metric.
     the raw id. Names are kept in memory only (no database) - a steady roster makes no API
     calls.
 - **Four notification channels** - all optional and independent (any can be left off):
-  - **In-game chat** - `X connected` / `X disconnected` via RCON `say`.
+  - **In-game chat** - `X connected` / `X disconnected` via RCON `say`, plus an optional
+    reminder (`CHAT_REMINDER`, e.g. a Discord invite) every `CHAT_REMINDER_MINUTES` while
+    anyone is online; the timer starts with the first player, so an empty server stays quiet.
   - **Telegram** - a single *pinned board* (server name, player count, current map, roster)
     edited in place, never spamming new messages: the board's message id is persisted
     (`BOARD_STATE_FILE`) so restarts reuse it. Plus a one-off message per join/leave. All

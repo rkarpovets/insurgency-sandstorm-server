@@ -51,6 +51,8 @@ BOARD_DIR        = os.environ.get("BOARD_DIR", "").strip()
 BOARD_OFFLINE_AFTER = 600
 DISCORD_BOARD_WEBHOOK  = os.environ.get("DISCORD_BOARD_WEBHOOK", "").strip().rstrip("/")
 DISCORD_EVENTS_WEBHOOK = os.environ.get("DISCORD_EVENTS_WEBHOOK", "").strip().rstrip("/")
+CHAT_REMINDER    = os.environ.get("CHAT_REMINDER", "").strip()
+CHAT_REMINDER_MINUTES = float(os.environ.get("CHAT_REMINDER_MINUTES", "0") or 0)
 
 TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
 DISCORD_ENABLED  = bool(DISCORD_BOARD_WEBHOOK or DISCORD_EVENTS_WEBHOOK)
@@ -96,6 +98,7 @@ login_names: OrderedDict[str, str] = OrderedDict()
 _reconcile_pending: bool = False    # a join/session-warning asked for an immediate reconcile
 _last_travel_time: float = 0.0        # last crash-recovery travelscenario we issued
 _last_travel_seen: float = 0.0        # last ProcessServerTravel observed in the log
+_next_reminder: float | None = None
 
 # Game-alert state
 _current_map: str = "-"               # human map name (Scenario token, not the level)
@@ -670,6 +673,19 @@ def player_event(name: str, action: str) -> None:
     write_metrics()
 
 
+def chat_reminder() -> None:
+    global _next_reminder
+    if not CHAT_REMINDER or CHAT_REMINDER_MINUTES <= 0 or player_count() == 0:
+        _next_reminder = None
+        return
+    now = time.monotonic()
+    if _next_reminder is None:
+        _next_reminder = now + CHAT_REMINDER_MINUTES * 60
+    elif now >= _next_reminder:
+        send_rcon(f"say {CHAT_REMINDER}")
+        _next_reminder = now + CHAT_REMINDER_MINUTES * 60
+
+
 def roster_refresh() -> None:
     """Refresh the board + metric WITHOUT announcing - used at startup and for
     safety-net reconciliation of players we picked up implicitly."""
@@ -945,6 +961,7 @@ def watch_logs() -> None:
                         write_metrics()
                         if BOARD_DIR:
                             _board_dirty.set()
+                        chat_reminder()
                         last_reconcile = time.monotonic()
 
                     line = f.readline()
