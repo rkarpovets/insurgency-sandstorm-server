@@ -47,11 +47,12 @@ BOARD_STATE_FILE = os.environ.get("BOARD_STATE_FILE", "board_message_id.txt")
 METRICS_FILE     = os.environ.get("METRICS_FILE", "").strip()
 SERVER_ID        = os.environ.get("SERVER_ID", "").strip()
 SERVER_TAG       = os.environ.get("SERVER_TAG", "").strip()
+SERVER_LABEL     = os.environ.get("SERVER_LABEL", "").strip()
 BOARD_DIR        = os.environ.get("BOARD_DIR", "").strip()
 BOARD_OFFLINE_AFTER = 600
 DISCORD_BOARD_WEBHOOK  = os.environ.get("DISCORD_BOARD_WEBHOOK", "").strip().rstrip("/")
 DISCORD_EVENTS_WEBHOOK = os.environ.get("DISCORD_EVENTS_WEBHOOK", "").strip().rstrip("/")
-CHAT_REMINDER    = os.environ.get("CHAT_REMINDER", "").strip()
+CHAT_REMINDER_FILE = os.environ.get("CHAT_REMINDER_FILE", "").strip()
 CHAT_REMINDER_MINUTES = float(os.environ.get("CHAT_REMINDER_MINUTES", "0") or 0)
 
 TELEGRAM_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
@@ -99,6 +100,7 @@ _reconcile_pending: bool = False    # a join/session-warning asked for an immedi
 _last_travel_time: float = 0.0        # last crash-recovery travelscenario we issued
 _last_travel_seen: float = 0.0        # last ProcessServerTravel observed in the log
 _next_reminder: float | None = None
+_reminder_index: int = 0
 
 # Game-alert state
 _current_map: str = "-"               # human map name (Scenario token, not the level)
@@ -589,8 +591,14 @@ def notify_event(name: str, action: str, count: int, map_name: str) -> None:
         _event_queue.put((name, action, count, map_name))
 
 
+def _event_prefix() -> str:
+    if SERVER_LABEL:
+        return f"{SERVER_LABEL}:\n"
+    return f"{SERVER_TAG} " if SERVER_TAG else ""
+
+
 def _telegram_event_text(name: str, action: str, count: int, map_name: str) -> str:
-    tag = f"{html.escape(SERVER_TAG)} " if SERVER_TAG else ""
+    tag = html.escape(_event_prefix())
     return (
         f"{tag}<b>{html.escape(name)}</b> {action} the server\n"
         f"{count}/{MAX_PLAYERS} - {html.escape(map_name)}"
@@ -598,7 +606,7 @@ def _telegram_event_text(name: str, action: str, count: int, map_name: str) -> s
 
 
 def _discord_event_text(name: str, action: str, count: int, map_name: str) -> str:
-    tag = f"{_md_escape(SERVER_TAG)} " if SERVER_TAG else ""
+    tag = _md_escape(_event_prefix())
     return (
         f"{tag}**{_md_escape(name)}** {action} the server\n"
         f"{count}/{MAX_PLAYERS} - {_md_escape(map_name)}"
@@ -673,17 +681,30 @@ def player_event(name: str, action: str) -> None:
     write_metrics()
 
 
+def _load_reminders() -> list[str]:
+    try:
+        with open(CHAT_REMINDER_FILE, "r", encoding="utf-8") as f:
+            return [line.strip() for line in f if line.strip()]
+    except OSError as e:
+        log.warning("Could not read reminders from %s: %s", CHAT_REMINDER_FILE, e)
+        return []
+
+
 def chat_reminder() -> None:
-    global _next_reminder
-    if not CHAT_REMINDER or CHAT_REMINDER_MINUTES <= 0 or player_count() == 0:
-        _next_reminder = None
+    global _next_reminder, _reminder_index
+    if not CHAT_REMINDER_FILE or CHAT_REMINDER_MINUTES <= 0:
         return
     now = time.monotonic()
     if _next_reminder is None:
         _next_reminder = now + CHAT_REMINDER_MINUTES * 60
-    elif now >= _next_reminder:
-        send_rcon(f"say {CHAT_REMINDER}")
-        _next_reminder = now + CHAT_REMINDER_MINUTES * 60
+        return
+    if now < _next_reminder:
+        return
+    _next_reminder = now + CHAT_REMINDER_MINUTES * 60
+    reminders = _load_reminders()
+    if reminders:
+        send_rcon(f"say {reminders[_reminder_index % len(reminders)]}")
+        _reminder_index += 1
 
 
 def roster_refresh() -> None:
