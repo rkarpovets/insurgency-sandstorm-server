@@ -33,9 +33,10 @@ board, a Discord status channel, and a Prometheus/Grafana metric.
     the raw id. Names are kept in memory only (no database) - a steady roster makes no API
     calls.
 - **Four notification channels** - all optional and independent (any can be left off):
-  - **In-game chat** - `X connected` / `X disconnected` via RCON `say`, plus an optional
-    reminder (`CHAT_REMINDER`, e.g. a Discord invite) every `CHAT_REMINDER_MINUTES` while
-    anyone is online; the timer starts with the first player, so an empty server stays quiet.
+  - **In-game chat** - `X connected` / `X disconnected` via RCON `say`, plus optional
+    reminders: every `CHAT_REMINDER_MINUTES`, the next line of `CHAT_REMINDER_FILE`
+    (`Insurgency/Config/Server/Reminders.txt`) in rotation, counted from the manager's
+    start. The file is re-read each time, so edits apply without a restart.
   - **Telegram** - a single *pinned board* (server name, player count, current map, roster)
     edited in place, never spamming new messages: the board's message id is persisted
     (`BOARD_STATE_FILE`) so restarts reuse it. Plus a one-off message per join/leave. All
@@ -160,10 +161,11 @@ sudo journalctl -u sandstorm-manager.service -f     # manager (also written to s
 | Gameplay / bots | `Insurgency/Saved/Config/LinuxServer/Game.ini` |
 | Mutators / mods | `.env` -> `MUTATORS` (default `ISMCarmory_Legacy,ISMCJumpShoot`), `-ModList=Mods.txt` |
 | Admins / MOTD | `Insurgency/Config/Server/Admins.txt`, `Motd.txt` |
+| Chat reminders | `Insurgency/Config/Server/Reminders.txt` (one message per line); `.env` -> `CHAT_REMINDER_FILE`, `CHAT_REMINDER_MINUTES` (0 = off) |
 | Player name resolution | Log login lines (Steam + EOS); `.env` -> `STEAM_API_KEY` optional fallback for un-seen Steam players; else raw id |
 | Telegram board & alerts | `.env` -> `TELEGRAM_GAME_TOKEN`, `TELEGRAM_GAME_CHAT_ID` |
 | Discord board & alerts | `.env` -> `DISCORD_BOARD_WEBHOOK`, `DISCORD_EVENTS_WEBHOOK` (Channel Settings -> Integrations -> Webhooks); the board message id lives next to `BOARD_STATE_FILE`, or in `BOARD_DIR` when shared |
-| Several servers, one board | `.env` -> `SERVER_TAG` (e.g. `[1]`, prefixes join/leave messages) and a shared `BOARD_DIR`: every manager pointing at the same dir renders one pinned board with a section per server, sorted by tag |
+| Several servers, one board | `.env` -> `SERVER_TAG` (e.g. `[1]`, prefixes join/leave messages unless `SERVER_LABEL` is set, e.g. `Hardcore`, shown on its own line above the message) and a shared `BOARD_DIR`: every manager pointing at the same dir renders one pinned board with a section per server, sorted by tag |
 | Grafana player metric | `.env` -> `METRICS_FILE` (node_exporter textfile path); optional `SERVER_ID` adds a `server` label to every metric |
 | Env file path | `ENV_FILE` for both `server.sh` and the manager (defaults to `$HOME/.env` and `/home/steam/.env`) |
 
