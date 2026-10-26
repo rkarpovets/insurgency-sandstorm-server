@@ -1,7 +1,9 @@
 # Insurgency: Sandstorm - Co-op Server Config & Manager
 
-Configuration and tooling for a co-op (**Checkpoint**) *Insurgency: Sandstorm* dedicated
-server running the **ISMC** mod. The centrepiece is `servermanager.py` - a small,
+Configuration and tooling for co-op (**Checkpoint**) *Insurgency: Sandstorm* dedicated
+servers running the **ISMC** mod - in production a Balanced AI server and a Hardcore
+Checkpoint server, both built from this one repo (shared files at the root, per-server
+differences under `servers/<name>/`). The centrepiece is `servermanager.py` - a small,
 dependency-light watcher that keeps the server healthy (recovering from the end-of-match
 map-vote freeze) and surfaces live player activity to in-game chat, a pinned Telegram
 board, a Discord status channel, and a Prometheus/Grafana metric.
@@ -35,11 +37,14 @@ board, a Discord status channel, and a Prometheus/Grafana metric.
 - **Four notification channels** - all optional and independent (any can be left off):
   - **In-game chat** - `X connected` / `X disconnected` via RCON `say`, plus optional
     reminders: every `CHAT_REMINDER_MINUTES`, the next line of `CHAT_REMINDER_FILE`
-    (`Insurgency/Config/Server/Reminders.txt`) in rotation, counted from the manager's
-    start. The file is re-read each time, so edits apply without a restart.
+    (`Insurgency/Config/Server/Reminders.txt`, one message per line, per-server override
+    allowed) in rotation, counted from the manager's start and sent whether or not anyone
+    is online. The file is re-read each time, so edits apply without a restart. In-game
+    text can't be copied, so links there are kept short enough to type (`dsc.gg/cs20`).
   - **Telegram** - a single *pinned board* (server name, player count, current map, roster)
     edited in place, never spamming new messages: the board's message id is persisted
-    (`BOARD_STATE_FILE`) so restarts reuse it. Plus a one-off message per join/leave. All
+    (`BOARD_STATE_FILE`) so restarts reuse it. Plus a one-off message per join/leave,
+    headed by the server's `SERVER_LABEL` on its own line (or prefixed with `SERVER_TAG`). All
     Telegram I/O runs on a dedicated, debounced worker thread, so a slow or broken Telegram
     API can never stall game monitoring.
   - **Discord** - the same board as embed cards (one per server: green with players,
@@ -47,7 +52,10 @@ board, a Discord status channel, and a Prometheus/Grafana metric.
     join/leave messages through a second webhook - typically a read-only `#server-status`
     channel and an `#activity` channel. Mentions are disabled, so a player named
     `@everyone` pings nobody. Webhooks cannot pin, which is why the board gets its own
-    channel; if someone deletes it, the next update posts a fresh one.
+    channel; if someone deletes it, the next update posts a fresh one. Discord stamps a
+    webhook message with the webhook's name and avatar when it is created, so after
+    renaming the webhook delete the board message and its `discord_message_id` /
+    `discord_last_body` files - the next update posts it under the new name.
   - **Prometheus metric** - atomically writes `iss_players_online`, `iss_players_max` and
     `iss_map_info` to a node_exporter textfile (`METRICS_FILE`), which Grafana graphs
     against CPU load.
@@ -160,7 +168,7 @@ sudo journalctl -u sandstorm-manager.service -f     # manager (also written to s
 | Per-server config | `servers/<name>/` mirrors the `Insurgency/...` paths; a file there replaces the root one for that server (see `servers/sandstorm-hardcore/`) |
 | Gameplay / bots | `Insurgency/Saved/Config/LinuxServer/Game.ini` |
 | Mutators / mods | `.env` -> `MUTATORS` (default `ISMCarmory_Legacy,ISMCJumpShoot`), `-ModList=Mods.txt` |
-| Admins / MOTD | `Insurgency/Config/Server/Admins.txt`, `Motd.txt` |
+| Admins / MOTD | `Insurgency/Config/Server/Admins.txt`, `Motd.txt` (read at server start only) |
 | Chat reminders | `Insurgency/Config/Server/Reminders.txt` (one message per line); `.env` -> `CHAT_REMINDER_FILE`, `CHAT_REMINDER_MINUTES` (0 = off) |
 | Player name resolution | Log login lines (Steam + EOS); `.env` -> `STEAM_API_KEY` optional fallback for un-seen Steam players; else raw id |
 | Telegram board & alerts | `.env` -> `TELEGRAM_GAME_TOKEN`, `TELEGRAM_GAME_CHAT_ID` |
@@ -184,6 +192,18 @@ runtime with RCON `travelscenario <Scenario>` - that resolves the level itself.
 - `.env` and the engine-generated configs are git-ignored - **never commit secrets** (RCON
   password, GSLT/GameStats tokens, Telegram token, Discord webhook URLs - the URL is the
   credential).
+- **XP needs a valid GameStats token.** Check the log after a start:
+  `GameStats submission enabled! XP gains enabled.` is good, `Invalid or unknown
+  GameStatsToken` means no XP. The token belongs to the Steam account: generating a new
+  one invalidated the previous one, so run every server on the same token. A GSLT, unlike
+  it, must be unique per server.
+- **What needs a restart.** The game reads `Motd.txt`, `MapCycle.txt`, `Admins.txt`,
+  `Game.ini`, `Engine.ini` and the launch tokens only at start; the manager reads `.env` only
+  at start; `Reminders.txt` is re-read on every reminder.
+- **`Game.ini` is rewritten on exit.** On a clean shutdown the game writes its in-memory
+  settings back to `Saved/Config/LinuxServer/Game.ini`, so a file replaced while the server
+  runs is lost at the next stop. Deploy it read-only for the game user (production: owned
+  by root, `0644`).
 - `Insurgency.log` grows very fast (multiple GB/day on a busy server) and is only rotated on
   restart - set up a size-capped cleanup (e.g. a small cron/systemd-timer that prunes old
   `Insurgency-backup-*.log` files) so it doesn't fill the disk.
