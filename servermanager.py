@@ -49,6 +49,7 @@ SERVER_ID        = os.environ.get("SERVER_ID", "").strip()
 SERVER_TAG       = os.environ.get("SERVER_TAG", "").strip()
 SERVER_LABEL     = os.environ.get("SERVER_LABEL", "").strip()
 BOARD_DIR        = os.environ.get("BOARD_DIR", "").strip()
+BATTLEMETRICS_SERVER_ID = os.environ.get("BATTLEMETRICS_SERVER_ID", "").strip()
 BOARD_OFFLINE_AFTER = 600
 DISCORD_BOARD_WEBHOOK  = os.environ.get("DISCORD_BOARD_WEBHOOK", "").strip().rstrip("/")
 DISCORD_EVENTS_WEBHOOK = os.environ.get("DISCORD_EVENTS_WEBHOOK", "").strip().rstrip("/")
@@ -78,6 +79,8 @@ DISCORD_USER_AGENT = "DiscordBot (https://github.com/rkarpovets/insurgency-sands
 DISCORD_COLOR_PLAYERS = 0x2ECC71
 DISCORD_COLOR_EMPTY   = 0x5865F2
 DISCORD_COLOR_OFFLINE = 0x95A5A6
+BATTLEMETRICS_REFRESH_SECONDS = 6 * 60 * 60
+BATTLEMETRICS_HTTP_TIMEOUT = 5.0
 
 # Logging
 logging.basicConfig(
@@ -101,6 +104,9 @@ _last_travel_time: float = 0.0        # last crash-recovery travelscenario we is
 _last_travel_seen: float = 0.0        # last ProcessServerTravel observed in the log
 _next_reminder: float | None = None
 _reminder_index: int = 0
+_battlemetrics_rank: int | None = None
+_battlemetrics_rank_checked_at: float = 0.0
+_battlemetrics_rank_retry_at: float = 0.0
 
 # Game-alert state
 _current_map: str = "-"               # human map name (Scenario token, not the level)
@@ -352,8 +358,38 @@ def _save_board_id(msg_id: int) -> None:
         log.warning("Could not persist board message id: %s", e)
 
 
+def _refresh_battlemetrics_rank() -> tuple[int | None, int | None]:
+    global _battlemetrics_rank
+    global _battlemetrics_rank_checked_at, _battlemetrics_rank_retry_at
+    if not BATTLEMETRICS_SERVER_ID:
+        return None, None
+    now = time.monotonic()
+    if now >= _battlemetrics_rank_retry_at:
+        server_id = urllib.parse.quote(BATTLEMETRICS_SERVER_ID, safe="")
+        url = f"https://api.battlemetrics.com/servers/{server_id}"
+        request = urllib.request.Request(
+            url,
+            headers={"Accept": "application/vnd.api+json", "User-Agent": DISCORD_USER_AGENT},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=BATTLEMETRICS_HTTP_TIMEOUT) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            attributes = payload.get("data", {}).get("attributes", {})
+            rank = attributes.get("rank")
+            _battlemetrics_rank = int(rank) if rank is not None and int(rank) > 0 else None
+            _battlemetrics_rank_checked_at = time.time()
+            _battlemetrics_rank_retry_at = now + BATTLEMETRICS_REFRESH_SECONDS
+        except Exception as e:
+            log.warning("BattleMetrics rank lookup failed for server %s: %s",
+                        BATTLEMETRICS_SERVER_ID, e)
+            _battlemetrics_rank_retry_at = now + 15 * 60
+    checked_at = int(_battlemetrics_rank_checked_at) if _battlemetrics_rank_checked_at else None
+    return _battlemetrics_rank, checked_at
+
+
 def _own_board_state() -> dict:
-    return {
+    rank, rank_checked_at = _refresh_battlemetrics_rank()
+    state = {
         "tag": SERVER_TAG,
         "name": SERVER_NAME,
         "count": player_count(),
@@ -362,6 +398,11 @@ def _own_board_state() -> dict:
         "players": list(player_cache.values()),
         "seen": time.time(),
     }
+    if BATTLEMETRICS_SERVER_ID:
+        state["battlemetrics_rank"] = rank
+        state["battlemetrics_rank_checked_at"] = rank_checked_at
+        state["battlemetrics_url"] = f"https://www.battlemetrics.com/servers/sandstorm/{BATTLEMETRICS_SERVER_ID}"
+    return state
 
 
 def _board_offline(state: dict) -> bool:
@@ -376,10 +417,20 @@ def _board_title(state: dict) -> str:
 def _board_section(state: dict) -> str:
     title = _board_title(state)
     roster = "\n".join(f"- {html.escape(n)}" for n in state.get("players", [])) or "<i>empty</i>"
+    rank = state.get("battlemetrics_rank")
+    rank_line = ""
+    if state.get("battlemetrics_url"):
+        rank_text = f"#{rank}" if rank is not None else "unavailable"
+        rank_line = (
+            f'🏆 BattleMetrics rank: '
+            f'<a href="{html.escape(state["battlemetrics_url"], quote=True)}">'
+            f'{rank_text}</a>\n'
+        )
     return (
         f"🎮 <b>{html.escape(title)}</b>\n"
         f"\n"
         f"👥 Players: <b>{state.get('count', 0)}/{state.get('max', 0)}</b>\n"
+        f"{rank_line}"
         f"🗺️ Map: <b>{html.escape(state.get('map', '-'))}</b>\n"
         f"\n"
         f"{roster}"
@@ -528,15 +579,28 @@ def _discord_embed(state: dict) -> dict:
         color = DISCORD_COLOR_PLAYERS
     else:
         color = DISCORD_COLOR_EMPTY
+    rank = state.get("battlemetrics_rank")
+    fields = [
+        {"name": "Players", "value": f"{state.get('count', 0)}/{state.get('max', 0)}",
+         "inline": True},
+    ]
+    if state.get("battlemetrics_url"):
+        rank_text = f"#{rank}" if rank is not None else "Unavailable"
+        fields.append({
+            "name": "BattleMetrics rank",
+            "value": f"[{rank_text}]({state['battlemetrics_url']})",
+            "inline": True,
+        })
+    fields.append({
+        "name": "Map",
+        "value": _md_escape(state.get("map", "-")) or "-",
+        "inline": True,
+    })
     return {
         "title": _board_title(state)[:256],
         "color": color,
         "description": ("\n".join(f"- {_md_escape(n)}" for n in players) or "*empty*")[:4096],
-        "fields": [
-            {"name": "Players", "value": f"{state.get('count', 0)}/{state.get('max', 0)}",
-             "inline": True},
-            {"name": "Map", "value": _md_escape(state.get("map", "-")) or "-", "inline": True},
-        ],
+        "fields": fields,
     }
 
 
