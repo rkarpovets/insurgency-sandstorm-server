@@ -41,13 +41,15 @@ board, a Discord status channel, and a Prometheus/Grafana metric.
     allowed) in rotation, counted from the manager's start and sent whether or not anyone
     is online. The file is re-read each time, so edits apply without a restart. In-game
     text can't be copied, so links there are kept short enough to type (`dsc.gg/cs20`).
-  - **Telegram** - a single *pinned board* (server name, player count, current map, roster)
+  - **Telegram** - a single *pinned board* (server name, player count, map,
+    BattleMetrics rank, roster)
     edited in place, never spamming new messages: the board's message id is persisted
     (`BOARD_STATE_FILE`) so restarts reuse it. Plus a one-off message per join/leave,
     headed by the server's `SERVER_LABEL` on its own line (or prefixed with `SERVER_TAG`). All
     Telegram I/O runs on a dedicated, debounced worker thread, so a slow or broken Telegram
     API can never stall game monitoring.
-  - **Discord** - the same board as embed cards (one per server: green with players,
+  - **Discord** - the same board as embed cards (one per server, including a
+    linked BattleMetrics rank: green with players,
     blue when empty, grey when offline) edited in place through a webhook, and the same
     join/leave messages through a second webhook - typically a read-only `#server-status`
     channel and an `#activity` channel. Mentions are disabled, so a player named
@@ -173,6 +175,7 @@ sudo journalctl -u sandstorm-manager.service -f     # manager (also written to s
 | Player name resolution | Log login lines (Steam + EOS); `.env` -> `STEAM_API_KEY` optional fallback for un-seen Steam players; else raw id |
 | Telegram board & alerts | `.env` -> `TELEGRAM_GAME_TOKEN`, `TELEGRAM_GAME_CHAT_ID` |
 | Discord board & alerts | `.env` -> `DISCORD_BOARD_WEBHOOK`, `DISCORD_EVENTS_WEBHOOK` (Channel Settings -> Integrations -> Webhooks); the board message id lives next to `BOARD_STATE_FILE`, or in `BOARD_DIR` when shared |
+| BattleMetrics rank | `.env` -> `BATTLEMETRICS_SERVER_ID`; fetched from the public server API every 6 hours and linked on both status boards |
 | Several servers, one board | `.env` -> `SERVER_TAG` (e.g. `[1]`, prefixes join/leave messages unless `SERVER_LABEL` is set, e.g. `Hardcore`, shown on its own line above the message) and a shared `BOARD_DIR`: every manager pointing at the same dir renders one pinned board with a section per server, sorted by tag |
 | Grafana player metric | `.env` -> `METRICS_FILE` (node_exporter textfile path); optional `SERVER_ID` adds a `server` label to every metric |
 | Env file path | `ENV_FILE` for both `server.sh` and the manager (defaults to `$HOME/.env` and `/home/steam/.env`) |
